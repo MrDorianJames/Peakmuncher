@@ -1,155 +1,114 @@
 # PeakMuncher
 
-A standalone, file-based waveshaping clipper inspired by [PeakEater](https://github.com/vvvar/PeakEater) — but built as an offline audio editor instead of a real-time plugin. Written in Rust with the [iced](https://github.com/iced-rs/iced) toolkit.
+A standalone offline waveshaping clipper for mastering and sound design, built in Rust with [iced](https://iced.rs/).
 
-## What it does
+PeakMuncher loads an audio file, lets you shape and tame its peaks with a choice of clipping curves, and exports the result. Unlike a real-time plugin, it works on the whole file at once — so you can see the entire waveform, park a probe point anywhere to analyze it, and split the timeline into independent **zones**, each with its own clipping settings.
 
-1. Open a `.wav`, `.flac`, `.mp3`, or `.aiff` file.
-2. See the waveform — input envelope plus a live processed envelope overlaid on top.
-3. Drop **splits** at any point to divide the track into zones, each with independent clipper parameters. Splits snap to nearest zero-crossing by default.
-4. Adjust **ceiling**, **input gain**, **output gain**, **clipper type**, and **oversampling** per zone.
-5. Audition with **Play / Pause** and flip between original and processed mid-playback (**A/B**) to hear the difference instantly.
-6. **Export** to WAV, FLAC, MP3, or AIFF when you're done. Bit depth (16/24-bit) is preserved from the source.
+---
 
 ## Features
 
-- **6 clipper curves** — Hard, Quintic, Cubic, Tangent, Algebraic, Arctangent.
-- **Zone-based step automation** — drop splits, give each region its own clipper config.
-- **Auto-detect zones** — analyzes dynamics + harmonic structure to suggest splits at musical boundaries.
-- **Oversampling** — per-zone 2×/4×/8× polyphase FIR (Kaiser-windowed sinc), applied at export for cleaner saturation.
-- **Two normalization modes** — Peak (dBFS) for headroom, LUFS (BS.1770/EBU R128) for loudness matching to streaming targets.
-- **Real-time spectrum + spectrogram views** — toggle with `F`.
-- **Reduction overlay** — visualize what the clipper is actually shaving off.
-- **Customizable theme** — Dark / Light, accent colors (or follow KDE system accent), waveform color schemes.
-- **Customizable keybindings** — edit `~/.config/peakmuncher/settings.json`.
-- **Project files** — save zone setup + view state to `.pmproj`, reload later.
-- **Zone presets** — save just the zone config to `.pmpreset`, apply to any compatible track.
-- **Undo/redo**, **recent files**, **cmd-line file argument** for `xdg-open` integration.
+### Zone-based processing
+Split the timeline at any point and give each **zone** its own independent settings — clipper type, ceiling, gain, fades, and DC correction. A quiet intro and a loud drop can be clipped completely differently in the same pass.
 
-## Keyboard shortcuts
+### Nine clipping curves
+Each zone can use any of nine waveshaping curves, from transparent to aggressive:
 
-All shortcuts are configurable in `~/.config/peakmuncher/settings.json`. Defaults:
+| Curve | Character |
+|-------|-----------|
+| Hard | Brick-wall, hardest edge |
+| Quintic | Smooth polynomial knee |
+| Cubic | Gentle polynomial knee |
+| Tangent | Rounded saturation |
+| Algebraic | Soft algebraic curve |
+| Arctangent | Smooth analog-style |
+| Sine Fold | Wavefolder — bright, aggressive, harmonically rich |
+| Tanh Drive | Warm, tape-like |
+| Sigmoid | Clean, polished logistic curve |
 
-| Key | Action |
-|---|---|
-| `Space` | Play / pause |
-| `Shift+Space` | Rewind to start |
-| `S` | Add split at playhead |
-| `Z` | Toggle zero-crossing snap |
-| `R` | Toggle reduction overlay |
-| `F` | Cycle FFT view (off / spectrum / spectrogram) |
-| `=` / `-` | Zoom in / out (around playhead) |
-| `0` | Reset zoom (fit whole file) |
-| `←` / `→` | Previous / next zone |
-| `Del` | Remove selected split |
-| `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
+All curves are bounded and pass cleanly through zero.
 
-Mouse: middle-click drag to pan, scroll wheel to zoom, two-finger horizontal scroll to pan, right-click a zone for copy/paste/delete-split.
+### Analysis and metering
+- **Frozen probe-point spectrum** — park the playhead anywhere and see a high-resolution (16384-point, Blackman-Harris, frame-averaged) spectrum of that moment.
+- **Input vs. output overlay** — the original and processed spectra are drawn together, with a difference fill (amber = harmonics the clipper *added*, blue = energy it *removed*) so you can see exactly what each mode does to the sound.
+- **Spectrogram view** — a whole-file frequency heatmap.
+- **Per-zone input peak marker** on the ceiling slider, showing exactly where clipping begins.
+- **Live input/output level meters.**
 
-## Audio formats
+### Level and cleanup tools
+- **Input gain** to drive the clipper.
+- **Ceiling** control (the clipping threshold).
+- **Oversampling** (applied on export) to reduce aliasing.
+- **Normalize** — peak or LUFS, measured over the trim region.
+- **Fade in / fade out** per zone (anchored to the trim window).
+- **DC offset** correction and a **DC blocker** (one-pole high-pass).
 
-| Format | Read | Write |
-|---|---|---|
-| WAV | 8/16/24-bit int, 32-bit float | 16/24-bit int (matches source), 32-bit float fallback |
-| FLAC | 16/24-bit | 16/24-bit (matches source) |
-| MP3 | up to 320kbps | 320kbps CBR |
-| AIFF / AIFC | 16/24/32-bit BE int, 32/64-bit BE float, sowt LE int | 16/24-bit BE int (matches source) |
+### Editing
+- **Trim** handles to set the exported region; fades and normalization respect the trim boundaries.
+- **A/B** toggle to compare original against processed.
+- **Apply** to bake changes into the working buffer, with a multi-step undo/redo history.
 
-Bit depth is preserved across formats — open a 24-bit AIFF, export to WAV, you'll get 24-bit WAV.
+### Interface
+- Four-tab control panel: **Clipper**, **Levels**, **Fix**, **Output**.
+- Waveform canvas with input/output overlay, clipping visualization, zoom, and sample-level detail.
+- Dark theme with KDE-style accent coloring.
 
-## Clipper types
+---
 
-All six are reimplemented from first principles (no PeakEater code copied):
+## Supported formats
 
-| Type | Curve |
-|---|---|
-| Hard | `clamp(x, ±C)` — brick wall |
-| Quintic | 5th-order polynomial, smooth saturation |
-| Cubic | `1.5x − 0.5x³`, smooth saturation |
-| Tangent | `tanh(x)`, classic warm soft-clip |
-| Algebraic | `x / √(1 + x²)`, asymptotic |
-| Arctangent | `(2/π)·atan(x)`, asymptotic |
+**Input:** WAV, FLAC, MP3, AIFF
+**Output:** WAV, FLAC, MP3
 
-## Build
+---
 
-You'll need a recent stable Rust toolchain (1.78+). On Arch:
+## Building
+
+PeakMuncher is a standard Cargo project.
 
 ```bash
-sudo pacman -S --needed base-devel pkgconf flac lame libxkbcommon wayland alsa-lib
-
-git clone <wherever you put this>
-cd peakmuncher
 cargo build --release
-./target/release/peakmuncher
 ```
 
-On Debian/Ubuntu:
-```bash
-sudo apt install build-essential pkg-config libflac-dev libmp3lame-dev \
-                 libxkbcommon-dev libwayland-dev libasound2-dev
-```
+The binary is written to `target/release/`.
 
-The binary is fully standalone after build — no DAW required.
+### Requirements
+- Rust (recent stable toolchain)
+- A Linux desktop environment (developed and tested on CachyOS / KDE Plasma). The GUI uses [iced](https://iced.rs/) with a wgpu backend.
 
-`alsa-lib` is needed by cpal for audio output. FLAC encode/decode are pure-Rust (no libFLAC linking required at runtime, but pkg-config picks up headers at build time).
+---
 
-## Configuration
+## Usage
 
-PeakMuncher writes config files to `~/.config/peakmuncher/`:
+1. **Open** an audio file.
+2. **Split** the timeline into zones at the cursor if you want different settings for different sections (optional — one zone covers the whole file by default).
+3. Pick a **clipper** curve and set the **ceiling** for the selected zone.
+4. Use the **FFT/spectrum** view to see how the curve reshapes the harmonics — park the playhead on a telling moment (a kick, an exposed bass note) and compare input vs. output.
+5. Set **fades**, **normalize**, and any **DC** cleanup as needed.
+6. **Trim** to the region you want to export.
+7. **Save** the result.
 
-- `settings.json` — theme, accent, waveform scheme, default folders, keybindings.
-- `recent.json` — recent file list.
+---
 
-Delete either to reset to defaults. Both are auto-created on first run.
+## Project layout
 
-## Project files
+| File | Responsibility |
+|------|----------------|
+| `main.rs` | App state, UI, message handling, history, export |
+| `waveform.rs` | Waveform, spectrum, and spectrogram rendering; canvas interaction |
+| `zones.rs` | Per-zone DSP render (clipping, gain, fades, DC) |
+| `dsp.rs` | The clipping curve functions |
+| `fft.rs` | FFT spectrum and spectrogram analysis |
+| `project.rs` | Project save/load |
 
-Save a `.pmproj` to capture: the audio file path (absolute + relative — whichever resolves), all splits and zone parameters, and view state (zoom, scroll, normalization mode and target). Open from File menu or by passing on the command line.
+---
 
-`.pmpreset` files store just the zone configuration, applicable to any track of compatible duration.
+## Status
 
-## KDE Plasma notes
+Actively developed. Working build. See `PEAKMUNCHER_HANDOFF.md` for detailed development notes and the roadmap.
 
-`rfd` (the file dialog) auto-detects the desktop environment and uses xdg-portal on KDE — you'll get the native Plasma file picker, not a fallback GTK one. If for some reason you want to force it, set `XDG_CURRENT_DESKTOP=KDE`.
-
-The "System" accent color option reads `~/.config/kdeglobals` for KDE's chosen accent. Other DEs fall back to the default Blue.
-
-If you want a `.desktop` launcher entry, drop this in `~/.local/share/applications/peakmuncher.desktop`:
-
-```ini
-[Desktop Entry]
-Type=Application
-Name=PeakMuncher
-Exec=/path/to/peakmuncher %f
-MimeType=audio/wav;audio/flac;audio/mpeg;audio/aiff;
-Icon=audio-x-generic
-Categories=AudioVideo;Audio;
-```
-
-## Architecture
-
-```
-src/
-├── main.rs        — iced app, state, controls panel, playback wiring
-├── waveform.rs    — canvas widget: envelope, zones, splits, playhead, rulers, meters, FFT
-├── zones.rs       — split-point model, per-zone params, render() function
-├── dsp.rs         — the six clipper curves
-├── audio_io.rs    — WAV (hound), FLAC (claxon + flacenc), MP3 (minimp3 + mp3lame), AIFF (custom)
-├── playback.rs    — cpal output stream, playhead state, A/B source switching
-├── fft.rs         — real-FFT spectrum + spectrogram via rustfft
-├── oversample.rs  — polyphase FIR upsampler/downsampler
-├── detect.rs      — auto-zone-detection: dynamics + chroma novelty
-├── structure.rs   — chroma vectors, self-similarity matrix, Foote checkerboard novelty
-├── recent.rs      — recent-files persistence
-├── project.rs     — .pmproj + .pmpreset serialization
-├── settings.rs    — theme/accent/scheme/folder persistence + KDE accent reader
-└── keybindings.rs — JSON-customizable shortcut parser
-```
-
-The DSP runs on a dedicated worker thread fed by an mpsc channel; if multiple parameter changes pile up, only the newest job runs (older ones are dropped). Per-zone clipping is parallelized across zones with `rayon`.
-
-LUFS measurement uses the [`ebur128`](https://github.com/sdroege/ebur128) crate — a pure-Rust port of the reference C library that passes the EBU R128 test set. Verified against ffmpeg's `loudnorm`: 0.03 LU error on a real master.
+---
 
 ## License
 
-GPL-3.0, matching PeakEater's license — though no PeakEater source is included or derived.
+See the [LICENSE](LICENSE) file in this repository.
