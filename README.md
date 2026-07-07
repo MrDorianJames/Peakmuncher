@@ -6,6 +6,9 @@ PeakMuncher loads an audio file, lets you shape and tame its peaks with a choice
 
 ---
 
+![Screenshot](Screenshot.png)
+
+
 ## Features
 
 ### Zone-based processing
