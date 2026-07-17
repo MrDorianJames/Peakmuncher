@@ -816,6 +816,7 @@ enum Msg {
     SetInputGain(f32),
     SetOutputGain(f32),
     SetClipper(ClipperType),
+    SetKnee(f32),
     SetOversampling(u8),
     SetDcOffset(f32),
     /// Measure the DC offset (mean value) of the selected zone's samples
@@ -1651,6 +1652,13 @@ impl App {
                     z.clipper = c;
                     self.snapshot();
                     return self.rebuild_processed();
+                }
+                Task::none()
+            }
+            Msg::SetKnee(v) => {
+                if let Some(z) = self.current_zone_mut() {
+                    z.knee = v.clamp(0.0, 1.0);
+                    return self.rebuild_processed_preview();
                 }
                 Task::none()
             }
@@ -4138,10 +4146,27 @@ impl App {
         .align_y(iced::Alignment::Center);
         let clipper_row = row![text("Clipper").width(110), clipper_pick].spacing(8);
 
-        let tab_content: Element<'_, Msg> = match self.active_tab {
-            ControlTab::Clipper => column![clipper_row, os_row, ceiling]
+        // Knee width — shown only for the Soft Knee clipper (the one clipper
+        // with a second parameter). Controls harmonic rolloff: narrow = sharp
+        // corner / brighter, wide = gentle shoulder / smoother.
+        let clipper_col: Element<'_, Msg> = if zone.clipper.uses_knee() {
+            let knee_row = row![
+                text("Knee").width(110),
+                slider(0.0..=1.0, zone.knee, Msg::SetKnee)
+                    .step(0.01)
+                    .on_release(Msg::Commit),
+                text(format!("{:.0}%", zone.knee * 100.0)).width(80),
+            ]
+            .spacing(8);
+            column![clipper_row, os_row, ceiling, knee_row]
                 .spacing(6)
-                .into(),
+                .into()
+        } else {
+            column![clipper_row, os_row, ceiling].spacing(6).into()
+        };
+
+        let tab_content: Element<'_, Msg> = match self.active_tab {
+            ControlTab::Clipper => clipper_col,
             ControlTab::Levels => column![in_gain].spacing(6).into(),
             ControlTab::Fix => column![dc_offset, dc_blocker].spacing(6).into(),
             ControlTab::Output => column![normalize, fade_in, fade_out]
@@ -4435,6 +4460,7 @@ fn zones_eq(a: &ZoneMap, b: &ZoneMap) -> bool {
             || (x.fade_out_secs - y.fade_out_secs).abs() > 1e-4
             || x.dc_blocker_enabled != y.dc_blocker_enabled
             || (x.dc_blocker_hz - y.dc_blocker_hz).abs() > 1e-3
+            || (x.knee - y.knee).abs() > 1e-4
         {
             return false;
         }

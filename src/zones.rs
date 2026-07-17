@@ -47,6 +47,18 @@ pub struct ZoneParams {
     /// sub-bass.
     #[serde(default = "default_dc_blocker_hz")]
     pub dc_blocker_hz: f32,
+    /// Soft-knee width (half-width as a fraction of the ceiling), used only
+    /// when `clipper == SoftKnee`. 0 = hard corner, up to ~1.0 = very wide,
+    /// gentle shoulder. Default a moderate 0.3. `#[serde(default)]` keeps
+    /// old projects loading (they get 0.0 → a hard-corner soft-knee, which
+    /// only matters if they were somehow using SoftKnee, which didn't exist
+    /// before this field, so it's moot).
+    #[serde(default = "default_knee")]
+    pub knee: f32,
+}
+
+fn default_knee() -> f32 {
+    0.3
 }
 
 fn default_dc_blocker_hz() -> f32 {
@@ -77,6 +89,7 @@ impl Default for ZoneParams {
             fade_out_secs: 0.0,
             dc_blocker_enabled: false,
             dc_blocker_hz: 20.0,
+            knee: 0.3,
         }
     }
 }
@@ -178,6 +191,7 @@ pub fn render(
         out_gain: f32,
         ceiling: f32,
         clipper: ClipperType,
+        knee: f32,
         dc_offset: f32,
         fade_in_frames: usize,
         fade_out_frames: usize,
@@ -223,6 +237,7 @@ pub fn render(
                 out_gain: dsp::db_to_amp(z.output_gain_db),
                 ceiling: dsp::db_to_amp(z.ceiling_db.min(0.0)),
                 clipper: z.clipper,
+                knee: z.knee,
                 dc_offset: z.dc_offset,
                 fade_in_frames: fi.min(max_per_fade_frames),
                 fade_out_frames: fo.min(max_per_fade_frames),
@@ -290,7 +305,7 @@ pub fn render(
                         dc_y_prev[c] = y;
                         s = y;
                         s *= z.in_gain;
-                        let shaped = dsp::shape(s, z.ceiling, z.clipper);
+                        let shaped = dsp::shape(s, z.ceiling, z.clipper, z.knee);
                         let mut v = shaped * z.out_gain;
                         if fi > 0 || fo > 0 {
                             let frame_in_zone = i / ch;
@@ -341,7 +356,7 @@ pub fn render(
                                 // zone for correct fade ramps.
                                 let mut s = in_slice[i] + z.dc_offset;
                                 s *= z.in_gain;
-                                let shaped = dsp::shape(s, z.ceiling, z.clipper);
+                                let shaped = dsp::shape(s, z.ceiling, z.clipper, z.knee);
                                 let mut v = shaped * z.out_gain;
                                 if fi > 0 || fo > 0 {
                                     let frame_in_zone = i / ch;
@@ -413,6 +428,7 @@ pub fn render_envelope_decimated(
         out_gain: f32,
         ceiling: f32,
         clipper: ClipperType,
+        knee: f32,
         dc_offset: f32,
         fade_in_frames: usize,
         fade_out_frames: usize,
@@ -438,6 +454,7 @@ pub fn render_envelope_decimated(
                 out_gain: dsp::db_to_amp(z.output_gain_db),
                 ceiling: dsp::db_to_amp(z.ceiling_db.min(0.0)),
                 clipper: z.clipper,
+                knee: z.knee,
                 dc_offset: z.dc_offset,
                 fade_in_frames: fi.min(max_per_fade_frames),
                 fade_out_frames: fo.min(max_per_fade_frames),
@@ -465,7 +482,7 @@ pub fn render_envelope_decimated(
         }
         let mut s = acc / ch as f32 + z.dc_offset;
         s *= z.in_gain;
-        let shaped = dsp::shape(s, z.ceiling, z.clipper);
+        let shaped = dsp::shape(s, z.ceiling, z.clipper, z.knee);
         let mut v = shaped * z.out_gain;
         let fi = z.fade_in_frames;
         let fo = z.fade_out_frames;
@@ -596,6 +613,7 @@ pub fn render_with_oversampling(
         out_gain: f32,
         ceiling: f32,
         clipper: ClipperType,
+        knee: f32,
         oversampling: u8,
         dc_offset: f32,
         fade_in_frames: usize,
@@ -625,6 +643,7 @@ pub fn render_with_oversampling(
                 out_gain: dsp::db_to_amp(z.output_gain_db),
                 ceiling: dsp::db_to_amp(z.ceiling_db.min(0.0)),
                 clipper: z.clipper,
+                knee: z.knee,
                 oversampling: z.oversampling.max(1),
                 dc_offset: z.dc_offset,
                 fade_in_frames: fi.min(max_per_fade_frames),
@@ -698,7 +717,7 @@ pub fn render_with_oversampling(
                         s = y;
                     }
                     s *= z.in_gain;
-                    let shaped = dsp::shape(s, z.ceiling, z.clipper);
+                    let shaped = dsp::shape(s, z.ceiling, z.clipper, z.knee);
                     let mut v = shaped * z.out_gain;
                     if fi > 0 || fo > 0 {
                         v *= fade_gain(i / ch);
@@ -732,9 +751,10 @@ pub fn render_with_oversampling(
                 let out_gain = z.out_gain;
                 let ceiling = z.ceiling;
                 let clipper = z.clipper;
+                let knee = z.knee;
                 let mono_out = os.process_block(&mono_in, |s| {
                     let s = s * in_gain;
-                    let shaped = dsp::shape(s, ceiling, clipper);
+                    let shaped = dsp::shape(s, ceiling, clipper, knee);
                     shaped * out_gain
                 });
                 for n in 0..nframes {

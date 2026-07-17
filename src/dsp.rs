@@ -28,10 +28,17 @@ pub enum ClipperType {
     /// Logistic S-curve: smooth everywhere with a gentle approach to the
     /// rails. Clean, polished — sits between Cubic and Arctangent.
     Sigmoid,
+    /// Adjustable soft-knee: linear below the knee, a smooth parabolic bend
+    /// through the knee region, hard-flat above it. The knee WIDTH (a
+    /// separate per-zone param) sets how gradual the bend is — narrow ≈ hard
+    /// clip (sharp corner, bright), wide = gentle rounded shoulder
+    /// (fewer high harmonics, smoother). The "transparent but loud"
+    /// mastering curve, and the one clipper with a second control.
+    SoftKnee,
 }
 
 impl ClipperType {
-    pub const ALL: [ClipperType; 9] = [
+    pub const ALL: [ClipperType; 10] = [
         ClipperType::Hard,
         ClipperType::Quintic,
         ClipperType::Cubic,
@@ -41,6 +48,7 @@ impl ClipperType {
         ClipperType::SineFold,
         ClipperType::TanhDrive,
         ClipperType::Sigmoid,
+        ClipperType::SoftKnee,
     ];
 
     pub fn label(&self) -> &'static str {
@@ -54,7 +62,14 @@ impl ClipperType {
             ClipperType::SineFold => "Sine Fold",
             ClipperType::TanhDrive => "Tanh Drive",
             ClipperType::Sigmoid => "Sigmoid",
+            ClipperType::SoftKnee => "Soft Knee",
         }
+    }
+
+    /// Whether this clipper uses the per-zone `knee` parameter. Only SoftKnee
+    /// does — the UI shows the knee slider only for this type.
+    pub fn uses_knee(&self) -> bool {
+        matches!(self, ClipperType::SoftKnee)
     }
 }
 
@@ -65,8 +80,11 @@ impl std::fmt::Display for ClipperType {
 }
 
 /// Apply the chosen waveshaper. `ceiling` is linear amplitude (0..=1).
+/// `knee` (0..=1) is the soft-knee width as a fraction of the ceiling; used
+/// only by `SoftKnee`, ignored by the other shapers. 0 = hard corner, larger
+/// = wider, gentler bend.
 #[inline]
-pub fn shape(sample: f32, ceiling: f32, kind: ClipperType) -> f32 {
+pub fn shape(sample: f32, ceiling: f32, kind: ClipperType, knee: f32) -> f32 {
     if ceiling <= 1e-6 {
         return 0.0;
     }
@@ -137,6 +155,33 @@ pub fn shape(sample: f32, ceiling: f32, kind: ClipperType) -> f32 {
             // Normalize so |y| = 1 at |n| = 1.
             let norm = logistic(1.0).max(1e-6);
             (logistic(n) / norm).clamp(-1.0, 1.0)
+        }
+
+        // Adjustable soft-knee. Linear below the knee, a parabolic bend
+        // through it, flat above. `knee` is the HALF-width of the knee
+        // region as a fraction of the ceiling (so the knee spans
+        // [1-k, 1+k] in normalized space). The parabola is chosen so the
+        // curve is continuous AND slope-continuous at both edges — matching
+        // slope 1 at the lower edge and slope 0 at the upper — which is what
+        // avoids an audible kink. k=0 degenerates to a hard clip.
+        ClipperType::SoftKnee => {
+            let k = knee.clamp(0.0, 1.0);
+            let a = n.abs();
+            let mag = if k <= 1e-6 {
+                // Degenerate: hard clip.
+                a.min(1.0)
+            } else if a <= 1.0 - k {
+                // Below the knee: linear, untouched.
+                a
+            } else if a >= 1.0 + k {
+                // Above the knee: flat at the ceiling.
+                1.0
+            } else {
+                // Inside the knee: y = x - (x-(1-k))^2 / (4k).
+                let d = a - (1.0 - k);
+                a - (d * d) / (4.0 * k)
+            };
+            mag * n.signum()
         }
     };
     y * ceiling
