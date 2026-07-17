@@ -34,6 +34,10 @@ pub enum CanvasEvent {
     /// start<end constraint are enforced in the app update handler.
     MoveTrimStart(f32),
     MoveTrimEnd(f32),
+    /// Click-repair mode: user clicked to repair a click at this INPUT frame
+    /// index. Fired instead of Seek when click_repair_mode is on and the
+    /// view is zoomed to sample resolution.
+    RepairClick(usize),
 }
 
 pub struct Waveform<'a> {
@@ -60,6 +64,9 @@ pub struct Waveform<'a> {
     pub meter_out: f32,
     /// FFT view mode: 0 = off, 1 = spectrum line, 2 = spectrogram heatmap.
     pub fft_mode: u8,
+    /// When true, a click in the wave area (at sample zoom) fires
+    /// RepairClick(frame) instead of Seek — the click-repair tool is active.
+    pub click_repair_mode: bool,
     /// Spectrogram for input (used in mode 2). None if not yet computed.
     pub spectrogram_in: Option<&'a crate::fft::Spectrogram>,
     pub spectrogram_out: Option<&'a crate::fft::Spectrogram>,
@@ -1893,6 +1900,23 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
                         return (
                             canvas::event::Status::Captured,
                             Some(CanvasEvent::SelectSplit(i)),
+                        );
+                    }
+                }
+                // 2.5) Click-repair mode: if active and we're zoomed in far
+                // enough that samples are individually resolvable, a click
+                // repairs the click at that sample instead of seeking.
+                if self.click_repair_mode {
+                    let vis = self.visible_duration();
+                    let samples_visible = vis * self.sample_rate as f32;
+                    // Require enough zoom that each sample is at least ~3 px
+                    // wide, so the user is actually pointing at a sample.
+                    let px_per_sample = ww / samples_visible.max(1.0);
+                    if px_per_sample >= 3.0 {
+                        let frame = (t * self.sample_rate as f32).round() as usize;
+                        return (
+                            canvas::event::Status::Captured,
+                            Some(CanvasEvent::RepairClick(frame)),
                         );
                     }
                 }

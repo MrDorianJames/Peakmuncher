@@ -516,6 +516,10 @@ struct App {
     selected_zone: Option<usize>,
     /// Active control-panel tab (Clipper/Levels/Fix/Output).
     active_tab: ControlTab,
+    /// When true, clicking a sample dot (at sample zoom) repairs a click at
+    /// that sample instead of the normal seek/select interaction. Toggled by
+    /// the "Click Repair" button in the FIX tab.
+    click_repair_mode: bool,
     /// Cached input peak (dBFS) of the selected zone, for the Ceiling
     /// slider's peak marker. Recomputed on zone switch / file load /
     /// input-gain change (input gain shifts the peak the clipper sees).
@@ -828,6 +832,7 @@ enum Msg {
     SetFadeOut(f32),
     /// Toggle the per-zone DC blocker (one-pole high-pass).
     ToggleDcBlocker,
+    ToggleClickRepair,
     /// Set DC blocker cutoff frequency in Hz.
     SetDcBlockerHz(f32),
     /// Bake the current processed output into the input — "Apply".
@@ -969,6 +974,7 @@ impl App {
                 trim_end: None,
                 selected_zone: Some(0),
                 active_tab: ControlTab::Clipper,
+                click_repair_mode: false,
                 zone_input_peak_db: None,
                 cursor_time: None,
                 status,
@@ -1566,6 +1572,12 @@ impl App {
                         self.zone_ctx_menu = Some((zi, split_idx, x, y));
                         self.canvas_cache.clear();
                     }
+                    CanvasEvent::RepairClick(frame) => {
+                        // STAGE 1: fixed narrow span. repair_click_at handles
+                        // the buffer edit, undo frame, and rebuild — return
+                        // its task directly.
+                        return self.repair_click_at(frame, 2);
+                    }
                 }
                 if needs_rebuild {
                     self.rebuild_processed()
@@ -1682,6 +1694,11 @@ impl App {
                     self.snapshot();
                     return self.rebuild_processed();
                 }
+                Task::none()
+            }
+            Msg::ToggleClickRepair => {
+                self.click_repair_mode = !self.click_repair_mode;
+                self.canvas_cache.clear();
                 Task::none()
             }
             Msg::SetDcBlockerHz(hz) => {
@@ -2616,6 +2633,177 @@ impl App {
         r.into()
     }
 
+    /// Repair a click at input frame `center` by replacing a small span of
+    /// samples with linear interpolation between the good samples bracketing
+    /// it. STAGE 1: fixed narrow span (the clicked frame ± `half_span`),
+    /// simple linear heal — enough to prove the destructive-edit + undo +
+    /// refresh pipeline against the test file. Later stages add edge
+    /// detection, elastic falloff, and drag-to-sculpt.
+    ///
+    /// Edits the INPUT buffer (all channels) so the repair persists through
+    /// re-rendering, and records it as an undoable Apply-style frame that
+    /// does NOT disturb zone/normalize state (prev == post for those).
+    fn repair_click_at(&mut self, center: usize, _half_span: usize) -> Task<Msg> {
+        let Some(input) = self.input.clone() else {
+            return Task::none();
+        };
+        let ch = input.channels.max(1) as usize;
+        let frames = input.samples.len() / ch;
+        if frames < 5 || center >= frames {
+            return Task::none();
+        }
+
+        // --- Auto-detect the artifact extent around `center` ---------------
+        // Work on a mono view for detection. A click is a run of samples that
+        // deviate from what the surrounding (smooth) signal predicts. We:
+        //   1. estimate a "normal" deviation level from a wider context window
+        //      (median-ish via a high percentile of |second difference|), then
+        //   2. grow the repair region outward from `center` while samples are
+        //      anomalous, stopping once we see a few consecutive normal
+        //      samples on each side.
+        // This sizes the repair to the WHOLE artifact — a 1-sample spike stays
+        // tiny, a 40-sample step/splice expands to cover the step.
+        let mono: Vec<f32> = if ch == 1 {
+            (*input.samples).clone()
+        } else {
+            (0..frames)
+                .map(|f| {
+                    let mut s = 0.0;
+                    for c in 0..ch {
+                        s += input.samples[f * ch + c];
+                    }
+                    s / ch as f32
+                })
+                .collect()
+        };
+
+        // Second difference (curvature): small for smooth signal, large at
+        // click edges. |s[i-1] - 2 s[i] + s[i+1]|.
+        let curv = |i: usize| -> f32 {
+            if i == 0 || i + 1 >= frames {
+                0.0
+            } else {
+                (mono[i - 1] - 2.0 * mono[i] + mono[i + 1]).abs()
+            }
+        };
+
+        // Context window for the "normal" curvature level.
+        const CTX: usize = 400; // ~8ms at 48k — enough sine cycles for a baseline
+        let c_lo = center.saturating_sub(CTX);
+        let c_hi = (center + CTX).min(frames - 1);
+        let mut ctx_curv: Vec<f32> = (c_lo..=c_hi).map(curv).collect();
+        ctx_curv.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        // 80th-percentile curvature as the "normal upper bound"; anomaly = a
+        // healthy multiple above it, floored so near-silent regions still work.
+        let p80 = ctx_curv[(ctx_curv.len() * 8 / 10).min(ctx_curv.len() - 1)];
+        let thresh = (p80 * 6.0).max(0.02);
+
+        // Find every anomalous sample within a search window around the click,
+        // then take their min..max extent. This is the key to handling STEPS:
+        // a step has high curvature only at its two EDGES (the interior is
+        // smooth, just offset), so growing-while-anomalous would stop at the
+        // interior. Taking min..max of all anomalous samples in the window
+        // brackets BOTH edges and everything between — so clicking anywhere on
+        // a step heals the whole step. For a spike it's just the spike.
+        const SEARCH: usize = 64; // look this far each way for artifact edges
+        let s_lo = center.saturating_sub(SEARCH).max(1);
+        let s_hi = (center + SEARCH).min(frames - 2);
+        let mut lo = center;
+        let mut hi = center;
+        let mut found = false;
+        for i in s_lo..=s_hi {
+            if curv(i) > thresh {
+                if !found {
+                    lo = i;
+                    hi = i;
+                    found = true;
+                } else {
+                    lo = lo.min(i);
+                    hi = hi.max(i);
+                }
+            }
+        }
+        // If nothing crossed threshold (very subtle), fall back to a tiny span
+        // around the click so a click still does *something*.
+        if !found {
+            lo = center;
+            hi = center;
+        }
+        // Keep a good anchor on each side.
+        let lo = lo.max(1);
+        let hi = hi.min(frames - 2);
+        if hi < lo {
+            return Task::none();
+        }
+        let a = lo - 1; // last good frame before the region
+        let b = hi + 1; // first good frame after the region
+
+        // Copy the interleaved buffer and heal each channel independently by
+        // linear interpolation from frame a to frame b.
+        let mut new_samples: Vec<f32> = (*input.samples).clone();
+        for c in 0..ch {
+            let va = new_samples[a * ch + c];
+            let vb = new_samples[b * ch + c];
+            let denom = (b - a) as f32;
+            for f in lo..=hi {
+                let t = (f - a) as f32 / denom;
+                new_samples[f * ch + c] = va + (vb - va) * t;
+            }
+        }
+
+        let post_input = Arc::new(new_samples);
+        let post_mono_input = mono_from_interleaved(&post_input, input.channels);
+        let post_envelope_in = build_envelope(&post_mono_input, ENVELOPE_WIDTH);
+
+        // Record as an Apply-style frame with UNCHANGED zone/normalize state
+        // (prev == post for those), so undo/redo swaps only the audio buffer
+        // and leaves the user's processing settings intact.
+        let frame = ApplyFrame {
+            prev_input: input.samples.clone(),
+            prev_mono_input: self.mono_input.clone(),
+            prev_envelope_in: self.envelope_in.clone(),
+            prev_zones: self.zones.clone(),
+            prev_normalize_enabled: self.normalize_enabled,
+            prev_normalize_mode: self.normalize_mode,
+            prev_normalize_target_db: self.normalize_target_db,
+            post_input: post_input.clone(),
+            post_mono_input: post_mono_input.clone(),
+            post_envelope_in: post_envelope_in.clone(),
+        };
+        self.history.truncate(self.history_pos + 1);
+        self.history.push(HistoryEntry::Apply(frame));
+        self.history_pos = self.history.len() - 1;
+
+        // Enforce the 5-Apply cap (same policy as apply_processing).
+        let apply_count = self
+            .history
+            .iter()
+            .filter(|e| matches!(e, HistoryEntry::Apply(_)))
+            .count();
+        if apply_count > 5 {
+            if let Some(idx) = self
+                .history
+                .iter()
+                .position(|e| matches!(e, HistoryEntry::Apply(_)))
+            {
+                self.history.drain(0..=idx);
+                self.history_pos = self.history_pos.saturating_sub(idx + 1);
+            }
+        }
+
+        // Swap the healed buffer in as the new input.
+        if let Some(inp) = self.input.as_mut() {
+            inp.samples = post_input;
+        }
+        self.mono_input = post_mono_input.clone();
+        self.raw_input_mono = Arc::new(post_mono_input);
+        self.envelope_in = post_envelope_in;
+        self.recompute_zone_input_peak();
+        self.canvas_cache.clear();
+        self.invalidate_spectrum_line();
+        self.rebuild_processed()
+    }
+
     fn apply_processing(&mut self) -> Task<Msg> {
         let Some(input) = self.input.clone() else {
             return Task::none();
@@ -3273,6 +3461,7 @@ impl App {
                 meter_in: self.meter_in,
                 meter_out: self.meter_out,
                 fft_mode,
+                click_repair_mode: self.click_repair_mode,
                 spectrogram_in: self.spectrogram_in.as_deref(),
                 spectrogram_out: self.spectrogram_out.as_deref(),
                 spectrum_line_out: self.spectrum_line_out.as_deref().map(|v| v.as_slice()),
@@ -4068,8 +4257,29 @@ impl App {
         .spacing(8)
         .align_y(iced::Alignment::Center);
 
-        // Normalize state picker — `pick_list` to match the Clipper /
-        // Oversampling controls' visual language.
+        // Click-repair tool toggle. When on, clicking a sample (at sample
+        // zoom) heals a click there. STAGE 1: fixed-span linear interpolation.
+        let repair_label = if self.click_repair_mode {
+            "Click Repair: ON"
+        } else {
+            "Click Repair: off"
+        };
+        let repair_hint = if self.click_repair_mode {
+            "zoom in to sample level, click a glitch to heal it"
+        } else {
+            "removes clicks/glitches at sample level"
+        };
+        let click_repair = row![
+            text("Repair").width(110),
+            button(text(repair_label).size(13))
+                .on_press(Msg::ToggleClickRepair)
+                .padding([4, 10]),
+            text(repair_hint)
+                .size(11)
+                .color(Color::from_rgba(1.0, 1.0, 1.0, 0.45)),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
         let current_state = if !self.normalize_enabled {
             NormalizeState::Off
         } else {
@@ -4168,7 +4378,7 @@ impl App {
         let tab_content: Element<'_, Msg> = match self.active_tab {
             ControlTab::Clipper => clipper_col,
             ControlTab::Levels => column![in_gain].spacing(6).into(),
-            ControlTab::Fix => column![dc_offset, dc_blocker].spacing(6).into(),
+            ControlTab::Fix => column![dc_offset, dc_blocker, click_repair].spacing(6).into(),
             ControlTab::Output => column![normalize, fade_in, fade_out]
                 .spacing(6)
                 .into(),
