@@ -195,16 +195,23 @@ pub fn compute_spectrogram(mono: &[f32], sample_rate: u32) -> Spectrogram {
 }
 
 /// Map a dB value in [-100, 0] to an RGBA color for spectrogram rendering.
-/// Uses a viridis-ish ramp: dark blue → cyan → green → yellow → white-hot.
+/// Uses the MAGMA colormap: near-black → deep purple → magenta → orange →
+/// pale cream. Perceptually uniform (equal dB steps look like equal visual
+/// steps, unlike a rainbow/jet ramp), and its black low end reads cleanly as
+/// silence against the dark theme. Control points sampled from matplotlib's
+/// magma.
 pub fn db_to_rgba(db: f32) -> [f32; 4] {
     let t = ((db + 100.0) / 100.0).clamp(0.0, 1.0);
-    // Five-stop interpolation.
-    let stops: [(f32, [f32; 3]); 5] = [
-        (0.00, [0.05, 0.05, 0.18]),
-        (0.30, [0.13, 0.27, 0.55]),
-        (0.55, [0.13, 0.65, 0.45]),
-        (0.80, [0.93, 0.85, 0.18]),
-        (1.00, [1.00, 0.95, 0.85]),
+    // Magma control points across the 0..1 range.
+    let stops: [(f32, [f32; 3]); 8] = [
+        (0.00, [0.001, 0.000, 0.014]), // near black
+        (0.14, [0.078, 0.043, 0.206]), // deep indigo
+        (0.29, [0.232, 0.060, 0.438]), // purple
+        (0.43, [0.400, 0.086, 0.500]), // magenta-purple
+        (0.57, [0.588, 0.149, 0.474]), // magenta
+        (0.71, [0.867, 0.288, 0.376]), // red-orange
+        (0.86, [0.988, 0.553, 0.349]), // orange
+        (1.00, [0.987, 0.909, 0.749]), // pale cream
     ];
     let mut a = stops[0];
     let mut b = stops[1];

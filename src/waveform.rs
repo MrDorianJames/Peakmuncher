@@ -99,11 +99,32 @@ impl<'a> Waveform<'a> {
     fn top_inset(&self) -> f32 {
         if self.show_time_ruler { 22.0 } else { 0.0 }
     }
+    /// Height of the FFT/spectrum panel at the bottom, as a fraction of the
+    /// usable area (canvas minus top ruler and the always-on meter strip).
+    /// 0.5 = an even split with the waveform. Scales with the window so the
+    /// spectrum stays readable at any size. Only nonzero when a spectrum view
+    /// is active.
+    const FFT_PANEL_FRACTION: f32 = 0.5;
+
+    fn fft_panel_height(&self, canvas_h: f32) -> f32 {
+        if self.fft_mode == 0 {
+            return 0.0;
+        }
+        let meter = 18.0;
+        let usable = (canvas_h - self.top_inset() - meter).max(1.0);
+        // Give the FFT the configured fraction, but keep sane min/max so a
+        // tiny or huge window still leaves both areas usable. Guard against a
+        // window so small the max would fall below the min.
+        let target = usable * Self::FFT_PANEL_FRACTION;
+        let max_h = (usable - 60.0).max(1.0);
+        let min_h = 120.0_f32.min(max_h);
+        target.clamp(min_h, max_h)
+    }
+
     /// Bottom inset: peak-meter strip + optional FFT panel.
-    fn bottom_inset(&self) -> f32 {
+    fn bottom_inset_h(&self, canvas_h: f32) -> f32 {
         let meter = 18.0; // always shown
-        let fft = if self.fft_mode != 0 { 180.0 } else { 0.0 };
-        meter + fft
+        meter + self.fft_panel_height(canvas_h)
     }
 
     /// Bounds of the actual waveform drawing area (inset from canvas).
@@ -111,7 +132,7 @@ impl<'a> Waveform<'a> {
         let x = self.left_inset();
         let y = self.top_inset();
         let w = (canvas_w - x).max(1.0);
-        let h = (canvas_h - y - self.bottom_inset()).max(1.0);
+        let h = (canvas_h - y - self.bottom_inset_h(canvas_h)).max(1.0);
         (x, y, w, h)
     }
 
@@ -1569,26 +1590,48 @@ impl<'a> Waveform<'a> {
             db -= 12.0;
         }
 
-        // Frequency reference grid at 100, 1k, 10k Hz
-        for &hz in &[100.0_f32, 1000.0, 10_000.0] {
-            if hz < lo_hz || hz > hi_hz { continue; }
+        // Frequency reference grid. A 1-2-5 sequence per decade gives a
+        // reference roughly every half-octave without clutter. Major lines
+        // (labelled, brighter) at the round decade/half values; minor lines
+        // (fainter, unlabelled) fill the gaps so position is easy to read
+        // without the grid getting busy with text.
+        const GRID_MAJOR: [f32; 6] = [50.0, 100.0, 500.0, 1000.0, 5000.0, 10_000.0];
+        const GRID_MINOR: [f32; 8] = [
+            20.0, 30.0, 200.0, 300.0, 2000.0, 3000.0, 20_000.0, 15_000.0,
+        ];
+        let draw_grid_line = |frame: &mut Frame, hz: f32, alpha: f32, labelled: bool| {
+            if hz < lo_hz || hz > hi_hz {
+                return;
+            }
             let frac = (hz.log10() - log_lo) / (log_hi - log_lo);
             let x = wx + frac * w;
             let line = Path::line(Point::new(x, y), Point::new(x, y + h));
             frame.stroke(
                 &line,
                 Stroke::default()
-                    .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.12))
+                    .with_color(Color::from_rgba(1.0, 1.0, 1.0, alpha))
                     .with_width(1.0),
             );
-            let label = if hz >= 1000.0 { format!("{}k", hz as u32 / 1000) } else { format!("{}", hz as u32) };
-            frame.fill_text(Text {
-                content: label,
-                position: Point::new(x + 2.0, y + h - 12.0),
-                color: Color::from_rgba(1.0, 1.0, 1.0, 0.5),
-                size: 9.0.into(),
-                ..Text::default()
-            });
+            if labelled {
+                let label = if hz >= 1000.0 {
+                    format!("{}k", hz as u32 / 1000)
+                } else {
+                    format!("{}", hz as u32)
+                };
+                frame.fill_text(Text {
+                    content: label,
+                    position: Point::new(x + 2.0, y + h - 12.0),
+                    color: Color::from_rgba(1.0, 1.0, 1.0, 0.5),
+                    size: 9.0.into(),
+                    ..Text::default()
+                });
+            }
+        };
+        for &hz in GRID_MINOR.iter() {
+            draw_grid_line(frame, hz, 0.06, false);
+        }
+        for &hz in GRID_MAJOR.iter() {
+            draw_grid_line(frame, hz, 0.14, true);
         }
 
         let have_in = self.spectrum_line_in.map(|s| s.len() == bins).unwrap_or(false);
@@ -1966,7 +2009,7 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
 
             // Bottom strip background (under both meters + FFT panel) so the
             // meter_cache layer can paint on top of a stable backdrop.
-            let meter_y = total_h - self.bottom_inset();
+            let meter_y = total_h - self.bottom_inset_h(total_h);
             frame.fill_rectangle(
                 Point::new(wx, meter_y),
                 Size::new(ww, total_h - meter_y),
@@ -1991,7 +2034,7 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
             let total_w = frame.width();
             let total_h = frame.height();
             let (wx, _wy, ww, _wh) = self.wave_area(total_w, total_h);
-            let meter_y = total_h - self.bottom_inset();
+            let meter_y = total_h - self.bottom_inset_h(total_h);
             self.draw_peak_meters(frame, wx, meter_y, ww);
             if self.fft_mode == 1 {
                 let fft_y = meter_y + 18.0;
