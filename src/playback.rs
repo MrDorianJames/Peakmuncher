@@ -168,11 +168,6 @@ impl Player {
         self.state.mono_fold.store(on, Ordering::Relaxed);
     }
 
-    #[allow(dead_code)]
-    pub fn mono_fold(&self) -> bool {
-        self.state.mono_fold.load(Ordering::Relaxed)
-    }
-
     pub fn is_playing(&self) -> bool {
         self.state.playing.load(Ordering::Relaxed)
     }

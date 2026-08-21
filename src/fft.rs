@@ -419,8 +419,7 @@ pub fn correlation_timeline(samples: &[f32], channels: usize, sample_rate: u32) 
 }
 
 /// dB value represented by u8 code 0 (see `Spectrogram::data`).
-pub const SG_DB_FLOOR: f32 = -120.0;
-const SG_DB_STEP: f32 = -SG_DB_FLOOR / 255.0;
+const SG_DB_FLOOR: f32 = -120.0;
 
 /// A whole-file spectrogram: a flat `time × freq` grid of dB magnitudes.
 ///
@@ -458,17 +457,6 @@ impl Spectrogram {
     pub fn row(&self, t: usize) -> &[u8] {
         let fb = self.freq_bins;
         &self.data[t * fb..(t + 1) * fb]
-    }
-    /// Decode a stored code back to dB.
-    #[allow(dead_code)]
-    #[inline]
-    pub fn code_to_db(code: u8) -> f32 {
-        SG_DB_FLOOR + code as f32 * SG_DB_STEP
-    }
-    /// Time in seconds for the center of slice `i`.
-    #[allow(dead_code)]
-    pub fn time_secs(&self, i: usize) -> f32 {
-        (i * self.hop + self.fft_size / 2) as f32 / self.sample_rate as f32
     }
     pub fn empty(sample_rate: u32) -> Self {
         Self {

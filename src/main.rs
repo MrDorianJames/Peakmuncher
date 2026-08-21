@@ -57,7 +57,7 @@ enum SpectrumMode {
 }
 
 impl SpectrumMode {
-    /// All selectable modes, in display order (for the mode-selector row).
+    /// All selectable modes, in display order (View menu radio group).
     const ALL: [Self; 4] = [
         Self::Off,
         Self::Spectrum,
@@ -72,31 +72,8 @@ impl SpectrumMode {
             SpectrumMode::Phase => SpectrumMode::Off,
         }
     }
-    /// Long label with the "FFT:" prefix. Currently unused — kept because
-    /// it's the right string if a status-bar readout of the active mode is
-    /// ever wanted. (`menu_label` is what the View dropdown shows.)
-    #[allow(dead_code)]
-    fn label(self) -> &'static str {
-        match self {
-            SpectrumMode::Off => "FFT: Off",
-            SpectrumMode::Spectrum => "FFT: Spectrum",
-            SpectrumMode::Spectrogram => "FFT: Spectrogram",
-            SpectrumMode::Phase => "Phase",
-        }
-    }
-    /// Short label for the mode-selector row (placeholder until icons).
-    #[allow(dead_code)]
-    fn short_label(self) -> &'static str {
-        match self {
-            SpectrumMode::Off => "Off",
-            SpectrumMode::Spectrum => "Spec",
-            SpectrumMode::Spectrogram => "Sgram",
-            SpectrumMode::Phase => "Phase",
-        }
-    }
-    /// Full label for the View dropdown's radio rows. Unlike `label()` this
-    /// carries no "FFT:" prefix — the menu section caption already says
-    /// what the group is.
+    /// Label for the View dropdown's radio rows. No "FFT:" prefix — the
+    /// menu's section caption already says what the group is.
     fn menu_label(self) -> &'static str {
         match self {
             SpectrumMode::Off => "Off",

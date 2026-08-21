@@ -248,22 +248,39 @@ impl<'a> Waveform<'a> {
         Some((wx, self.overview_y(canvas_h), ww, OVERVIEW_H))
     }
 
-    /// Hit-test the mono-fold badge. Mirrors the geometry `draw_phase` uses
-    /// to place the goniometer column, so the two stay in agreement.
-    fn mono_badge_hit(&self, canvas_w: f32, canvas_h: f32, px: f32, py: f32) -> bool {
+    /// Rect of the Phase panel (the whole FFT area when Phase is active).
+    fn phase_panel_rect(&self, canvas_w: f32, canvas_h: f32) -> Option<(f32, f32, f32, f32)> {
         if self.fft_mode != 3 {
-            return false;
+            return None;
         }
         let (wx, _wy, ww, _wh) = self.wave_area(canvas_w, canvas_h);
-        let meter_y = self.meter_y(canvas_h);
-        let fft_y = meter_y + 18.0;
+        let fft_y = self.meter_y(canvas_h) + 18.0;
         let fft_h = canvas_h - fft_y;
         if fft_h <= 10.0 {
-            return false;
+            return None;
         }
-        let gonio_w = fft_h.min(ww * 0.40).max(60.0);
-        let band_w = (ww - gonio_w).max(40.0);
-        let (bx, by, bw, bh) = mono_badge_rect(wx + band_w, fft_y, gonio_w);
+        Some((wx, fft_y, ww, fft_h))
+    }
+
+    /// Goniometer column within the Phase panel: `(x, y, w, h)`.
+    ///
+    /// The single source for this split. `draw_phase` and the badge
+    /// hit-test both go through it, so a clickable control drawn in the
+    /// column can't drift away from its own click target.
+    fn gonio_rect(panel: (f32, f32, f32, f32)) -> (f32, f32, f32, f32) {
+        let (px, py, pw, ph) = panel;
+        let gw = ph.min(pw * 0.40).max(60.0);
+        let band_w = (pw - gw).max(40.0);
+        (px + band_w, py, gw, ph)
+    }
+
+    /// Hit-test the mono-fold badge.
+    fn mono_badge_hit(&self, canvas_w: f32, canvas_h: f32, px: f32, py: f32) -> bool {
+        let Some(panel) = self.phase_panel_rect(canvas_w, canvas_h) else {
+            return false;
+        };
+        let (gx, gy, gw, _gh) = Self::gonio_rect(panel);
+        let (bx, by, bw, bh) = mono_badge_rect(gx, gy, gw);
         px >= bx && px <= bx + bw && py >= by && py <= by + bh
     }
 
@@ -2033,11 +2050,11 @@ impl<'a> Waveform<'a> {
     fn draw_phase(&self, frame: &mut Frame, wx: f32, y: f32, w: f32, h: f32) {
         // Goniometer column: square where there's room, never more than ~40%
         // of the width (the frequency curve is the more informative panel).
-        let gonio_w = h.min(w * 0.40).max(60.0);
-        let band_w = (w - gonio_w).max(40.0);
+        let (gx, gy, gw, gh) = Self::gonio_rect((wx, y, w, h));
+        let band_w = (gx - wx).max(40.0);
         self.draw_band_correlation(frame, wx, y, band_w, h);
-        self.draw_goniometer(frame, wx + band_w, y, gonio_w, h);
-        self.draw_mono_badge(frame, wx + band_w, y, gonio_w);
+        self.draw_goniometer(frame, gx, gy, gw, gh);
+        self.draw_mono_badge(frame, gx, gy, gw);
     }
 
     /// The always-on overview strip: a whole-file map that doubles as the
@@ -2588,104 +2605,6 @@ impl<'a> Waveform<'a> {
             size: 11.0.into(),
             ..Text::default()
         });
-    }
-
-    /// The old standalone correlation BAR — a horizontal −1..+1 strip with a
-    /// marker at the broadband correlation.
-    ///
-    /// RETIRED: `draw_band_correlation` subsumes it. The curve shows the same
-    /// number (as the dashed reference line) plus where it comes from, so the
-    /// bar's screen space was better spent. Kept because it's a compact
-    /// readout that might earn a place elsewhere — delete it if it hasn't
-    /// been used by the next time you're in this file.
-    #[allow(dead_code)]
-    fn draw_correlation(&self, frame: &mut Frame, wx: f32, y: f32, w: f32, h: f32) {
-        use iced::widget::canvas::Text;
-        let pad = 24.0;
-        let bar_x = wx + pad;
-        let bar_w = (w - pad * 2.0).max(1.0);
-        let bar_y = y + h * 0.5;
-        let bar_h = (h * 0.16).clamp(14.0, 48.0);
-
-        // Track background.
-        let track = Path::rectangle(
-            Point::new(bar_x, bar_y - bar_h * 0.5),
-            Size::new(bar_w, bar_h),
-        );
-        frame.fill(&track, Color::from_rgba(1.0, 1.0, 1.0, 0.06));
-
-        // Zone tints: left third (−1..−0.33) red, middle amber, right green.
-        let third = bar_w / 3.0;
-        for (i, col) in [
-            Color::from_rgba(0.85, 0.25, 0.25, 0.14),
-            Color::from_rgba(0.90, 0.65, 0.20, 0.12),
-            Color::from_rgba(0.25, 0.75, 0.40, 0.12),
-        ]
-        .iter()
-        .enumerate()
-        {
-            let seg = Path::rectangle(
-                Point::new(bar_x + third * i as f32, bar_y - bar_h * 0.5),
-                Size::new(third, bar_h),
-            );
-            frame.fill(&seg, *col);
-        }
-
-        // Center line (0 correlation) and end ticks.
-        for (frac, label) in [(0.0, "-1"), (0.5, "0"), (1.0, "+1")] {
-            let x = bar_x + bar_w * frac;
-            let line = Path::line(
-                Point::new(x, bar_y - bar_h * 0.5 - 4.0),
-                Point::new(x, bar_y + bar_h * 0.5 + 4.0),
-            );
-            frame.stroke(
-                &line,
-                Stroke::default()
-                    .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.25))
-                    .with_width(1.0),
-            );
-            frame.fill_text(Text {
-                content: label.to_string(),
-                position: Point::new(x - 6.0, bar_y + bar_h * 0.5 + 6.0),
-                color: Color::from_rgba(1.0, 1.0, 1.0, 0.5),
-                size: 11.0.into(),
-                ..Text::default()
-            });
-        }
-
-        // The correlation marker.
-        if let Some(corr) = self.probe_correlation {
-            let frac = (corr + 1.0) / 2.0; // −1..1 -> 0..1
-            let x = bar_x + bar_w * frac;
-            let col = if corr < -0.1 {
-                Color::from_rgb(0.95, 0.35, 0.35)
-            } else if corr < 0.4 {
-                Color::from_rgb(0.95, 0.75, 0.30)
-            } else {
-                Color::from_rgb(0.40, 0.90, 0.55)
-            };
-            let marker = Path::rectangle(
-                Point::new(x - 2.0, bar_y - bar_h * 0.5 - 6.0),
-                Size::new(4.0, bar_h + 12.0),
-            );
-            frame.fill(&marker, col);
-            // Numeric readout.
-            frame.fill_text(Text {
-                content: format!("correlation {:+.2}", corr),
-                position: Point::new(bar_x, y + 2.0),
-                color: Color::from_rgba(1.0, 1.0, 1.0, 0.85),
-                size: 13.0.into(),
-                ..Text::default()
-            });
-        } else {
-            frame.fill_text(Text {
-                content: "no signal at probe".to_string(),
-                position: Point::new(bar_x, y + 2.0),
-                color: Color::from_rgba(1.0, 1.0, 1.0, 0.45),
-                size: 13.0.into(),
-                ..Text::default()
-            });
-        }
     }
 
     /// Goniometer: plot the probe window's L/R as a rotated X/Y figure. The
