@@ -38,6 +38,73 @@ pub enum CanvasEvent {
     /// index. Fired instead of Seek when click_repair_mode is on and the
     /// view is zoomed to sample resolution.
     RepairClick(usize),
+    /// Mono-fold badge in the goniometer's corner was clicked.
+    ToggleMonoFold,
+    /// Clicked or dragged on the correlation overview strip: seek here AND
+    /// bring the zoomed view to this point. Distinct from `Seek` because the
+    /// strip always shows the whole file, so its target is usually outside
+    /// the current view — seeking without scrolling would move the playhead
+    /// somewhere you can't see.
+    NavigateTo(f32),
+}
+
+/// Size of the mono-fold badge drawn in the goniometer's top-right corner.
+const MONO_BADGE_W: f32 = 30.0;
+const MONO_BADGE_H: f32 = 18.0;
+
+/// Height of the always-on overview strip that sits directly under the
+/// waveform. Fixed rather than proportional: it's a navigation bar, and a
+/// navigation bar that changes size as the window resizes is harder to
+/// build muscle memory for.
+pub const OVERVIEW_H: f32 = 22.0;
+
+/// Correlation → colour. Shared by the frequency curve and the timeline
+/// strip so the same value reads as the same colour in both, which is what
+/// lets you glance between them.
+///
+/// Stops are muted rather than saturated: this fills areas that sit behind
+/// brighter foreground elements, and shouldn't shout. Flat green through the
+/// whole +0.5..+1.0 range — normal material shouldn't look like it's doing
+/// something.
+fn corr_color_ramp(c: f32) -> (f32, f32, f32) {
+    const STOPS: [(f32, [f32; 3]); 5] = [
+        (1.00, [0.30, 0.72, 0.45]),  // green
+        (0.50, [0.34, 0.70, 0.42]),  // green (flat through healthy)
+        (0.25, [0.78, 0.62, 0.26]),  // amber
+        (0.00, [0.84, 0.44, 0.24]),  // orange
+        (-1.00, [0.86, 0.26, 0.26]), // red
+    ];
+    let c = c.clamp(-1.0, 1.0);
+    let mut a = STOPS[0];
+    let mut b = STOPS[1];
+    for i in 0..STOPS.len() - 1 {
+        if c <= STOPS[i].0 && c >= STOPS[i + 1].0 {
+            a = STOPS[i];
+            b = STOPS[i + 1];
+            break;
+        }
+    }
+    let span = (a.0 - b.0).max(1e-6);
+    let t = ((a.0 - c) / span).clamp(0.0, 1.0);
+    (
+        a.1[0] + (b.1[0] - a.1[0]) * t,
+        a.1[1] + (b.1[1] - a.1[1]) * t,
+        a.1[2] + (b.1[2] - a.1[2]) * t,
+    )
+}
+
+/// Where the mono badge sits, given the goniometer column's origin and width.
+///
+/// Drawing and hit-testing BOTH go through this, so the clickable rect can't
+/// drift away from the painted one — the classic way canvas-drawn controls
+/// break.
+fn mono_badge_rect(gx: f32, gy: f32, gw: f32) -> (f32, f32, f32, f32) {
+    (
+        gx + gw - MONO_BADGE_W - 6.0,
+        gy + 3.0,
+        MONO_BADGE_W,
+        MONO_BADGE_H,
+    )
 }
 
 pub struct Waveform<'a> {
@@ -67,6 +134,24 @@ pub struct Waveform<'a> {
     /// When true, a click in the wave area (at sample zoom) fires
     /// RepairClick(frame) instead of Seek — the click-repair tool is active.
     pub click_repair_mode: bool,
+    /// Frame indices of clicks found by the scanner, drawn as vertical
+    /// markers so the user can find them.
+    pub detected_clicks: &'a [usize],
+    /// Index of the currently-navigated click (highlighted brighter).
+    pub current_click: Option<usize>,
+    /// Stereo correlation (-1..1) at the probe point, for Correlation mode.
+    pub probe_correlation: Option<f32>,
+    /// Goniometer L/R points at the probe point, for Goniometer mode.
+    pub probe_gonio: &'a [(f32, f32)],
+    /// Whole-file correlation over time, for the strip at the top of the
+    /// Phase panel. `None` until computed.
+    pub corr_timeline: Option<&'a crate::fft::CorrTimeline>,
+    /// Whether mono-fold monitoring is engaged (lights the goniometer badge).
+    pub mono_fold: bool,
+    /// Per-frequency correlation at the probe: `(corr, weight)` per FFT bin,
+    /// bin `i` at `i / len * nyquist` Hz — the same frequency mapping the
+    /// spectrum line uses, so the two views line up.
+    pub probe_band_corr: &'a [(f32, f32)],
     /// Spectrogram for input (used in mode 2). None if not yet computed.
     pub spectrogram_in: Option<&'a crate::fft::Spectrogram>,
     pub spectrogram_out: Option<&'a crate::fft::Spectrogram>,
@@ -131,7 +216,17 @@ impl<'a> Waveform<'a> {
     /// Bottom inset: peak-meter strip + optional FFT panel.
     fn bottom_inset_h(&self, canvas_h: f32) -> f32 {
         let meter = 18.0; // always shown
-        meter + self.fft_panel_height(canvas_h)
+        OVERVIEW_H + meter + self.fft_panel_height(canvas_h)
+    }
+
+    /// Top edge of the overview strip (first thing below the waveform).
+    fn overview_y(&self, canvas_h: f32) -> f32 {
+        canvas_h - self.bottom_inset_h(canvas_h)
+    }
+
+    /// Top edge of the peak-meter strip, which sits under the overview.
+    fn meter_y(&self, canvas_h: f32) -> f32 {
+        self.overview_y(canvas_h) + OVERVIEW_H
     }
 
     /// Bounds of the actual waveform drawing area (inset from canvas).
@@ -141,6 +236,35 @@ impl<'a> Waveform<'a> {
         let w = (canvas_w - x).max(1.0);
         let h = (canvas_h - y - self.bottom_inset_h(canvas_h)).max(1.0);
         (x, y, w, h)
+    }
+
+    /// Screen rect of the overview strip. Drawing, the overlay, and
+    /// hit-testing all route through this so they can't disagree.
+    fn overview_rect(&self, canvas_w: f32, canvas_h: f32) -> Option<(f32, f32, f32, f32)> {
+        if self.duration <= 0.0 {
+            return None;
+        }
+        let (wx, _wy, ww, _wh) = self.wave_area(canvas_w, canvas_h);
+        Some((wx, self.overview_y(canvas_h), ww, OVERVIEW_H))
+    }
+
+    /// Hit-test the mono-fold badge. Mirrors the geometry `draw_phase` uses
+    /// to place the goniometer column, so the two stay in agreement.
+    fn mono_badge_hit(&self, canvas_w: f32, canvas_h: f32, px: f32, py: f32) -> bool {
+        if self.fft_mode != 3 {
+            return false;
+        }
+        let (wx, _wy, ww, _wh) = self.wave_area(canvas_w, canvas_h);
+        let meter_y = self.meter_y(canvas_h);
+        let fft_y = meter_y + 18.0;
+        let fft_h = canvas_h - fft_y;
+        if fft_h <= 10.0 {
+            return false;
+        }
+        let gonio_w = fft_h.min(ww * 0.40).max(60.0);
+        let band_w = (ww - gonio_w).max(40.0);
+        let (bx, by, bw, bh) = mono_badge_rect(wx + band_w, fft_y, gonio_w);
+        px >= bx && px <= bx + bw && py >= by && py <= by + bh
     }
 
     /// Convert sample-time to canvas x within the wave area.
@@ -1525,6 +1649,7 @@ impl<'a> Waveform<'a> {
         match self.fft_mode {
             1 => self.draw_spectrum_line(frame, wx, y, w, h),
             2 => self.draw_spectrogram(frame, wx, y, w, h),
+            3 => self.draw_phase(frame, wx, y, w, h),
             _ => {}
         }
     }
@@ -1713,47 +1838,913 @@ impl<'a> Waveform<'a> {
             });
             return;
         };
-        if sg.time_bins() == 0 { return; }
+        let n_slices = sg.time_bins();
+        if n_slices == 0 {
+            return;
+        }
 
         // Map: x = time (visible window), y = log-frequency, color = dB.
         let nyq = sg.sample_rate as f32 / 2.0;
-        let bins = sg.freq_bins();
+        let bins = sg.freq_bins;
+        if bins == 0 {
+            return;
+        }
         let lo_hz = 20.0_f32.max(nyq / bins as f32);
-        let hi_hz = nyq;
         let log_lo = lo_hz.log10();
-        let log_hi = hi_hz.log10();
+        let log_span = (nyq.log10() - log_lo).max(1e-6);
 
-        // For each pixel column, find the spectrogram time slice closest to
-        // that pixel's time, then draw a vertical strip of colored 1px rects.
         let pixels_w = w as usize;
         let pixels_h = h as usize;
+        if pixels_w == 0 || pixels_h == 0 {
+            return;
+        }
         let scroll = self.scroll;
         let vis = self.visible_duration();
 
+        // Precompute the bin span for each pixel ROW once, instead of per
+        // column. `bin_lo`/`bin_hi` is the range of FFT bins that row covers;
+        // `frac` is the sub-bin position used when the row covers less than
+        // one bin (the low end of a log axis, where several rows share a
+        // single bin).
+        struct RowMap {
+            bin_lo: usize,
+            bin_hi: usize,
+            frac: f32,
+            interp: bool,
+        }
+        let rows: Vec<RowMap> = (0..pixels_h)
+            .map(|py| {
+                // Row py covers the band between its top and bottom edges.
+                let f_top = 1.0 - (py as f32 / pixels_h as f32);
+                let f_bot = 1.0 - ((py + 1) as f32 / pixels_h as f32);
+                let hz_hi = 10f32.powf(log_lo + f_top * log_span);
+                let hz_lo = 10f32.powf(log_lo + f_bot * log_span);
+                let b_exact = (hz_lo / nyq) * bins as f32;
+                let b_lo = (b_exact.floor().max(0.0) as usize).min(bins - 1);
+                let b_hi = ((((hz_hi / nyq) * bins as f32).ceil() as usize).max(b_lo + 1))
+                    .min(bins);
+                RowMap {
+                    bin_lo: b_lo,
+                    bin_hi: b_hi,
+                    frac: b_exact - b_exact.floor(),
+                    // Fewer than ~1.5 bins in this row means we're in the
+                    // sparse low end, where nearest-bin sampling produces
+                    // the thick horizontal banding. Interpolate instead.
+                    interp: (b_hi - b_lo) <= 1,
+                }
+            })
+            .collect();
+
+        // How many time slices land in one pixel column.
+        let slices_per_px =
+            (vis * sg.sample_rate as f32 / sg.hop as f32) / pixels_w as f32;
+        // Cap how many of them we actually read. Taking every slice at 1x on
+        // a long file would be tens of millions of reads per repaint; 8
+        // spread across the range captures transients without the cost.
+        const MAX_SLICE_SAMPLES: usize = 8;
+
+        // When a single slice covers more than one pixel column (zoomed past
+        // the hop rate) we blend between neighbouring slices instead of
+        // repeating one. Without this, at high zoom each slice paints a
+        // solid block — at 700x that's a ~30px wide stripe.
+        //
+        // This is smoothing, not new information: the analysis window is
+        // 4096 samples (~85 ms), so genuinely finer time detail isn't in the
+        // data to recover. Interpolating is the honest way to present that
+        // — a gradient reads as "the analysis is coarse here" while a hard
+        // block misreads as "the audio changed abruptly here".
+        let time_interp = slices_per_px < 1.0;
+
+        // Read one slice's value for a pixel row, resolving the frequency
+        // axis (max across bins, or blend when the row covers under a bin).
+        let sample_slice = |si: usize, rm: &RowMap| -> f32 {
+            let row = sg.row(si);
+            if rm.interp {
+                // Sparse low end: linear blend between adjacent bins so the
+                // bass reads as a gradient instead of blocks.
+                let a = row[rm.bin_lo] as f32;
+                let b = row[(rm.bin_lo + 1).min(bins - 1)] as f32;
+                a + (b - a) * rm.frac
+            } else {
+                let mut best = 0u8;
+                for &v in &row[rm.bin_lo..rm.bin_hi] {
+                    if v > best {
+                        best = v;
+                    }
+                }
+                best as f32
+            }
+        };
+
+        let half_fft = sg.fft_size as f32 / 2.0;
         for px in 0..pixels_w {
-            let t = scroll + (px as f32 / pixels_w as f32) * vis;
-            let slice_idx = ((t * sg.sample_rate as f32 - crate::fft::FFT_SIZE as f32 / 2.0)
-                / sg.hop as f32) as isize;
-            if slice_idx < 0 || (slice_idx as usize) >= sg.time_bins() {
+            let t0 = scroll + (px as f32 / pixels_w as f32) * vis;
+            let s_center =
+                (t0 * sg.sample_rate as f32 - half_fft) / sg.hop as f32;
+            if s_center < 0.0 {
                 continue;
             }
-            let slice = &sg.slices[slice_idx as usize];
+            let s0 = s_center as usize;
+            if s0 >= n_slices {
+                continue;
+            }
+            let s_frac = s_center - s_center.floor();
+            let s_next = (s0 + 1).min(n_slices - 1);
+            let s1 = (s0 + slices_per_px.ceil().max(1.0) as usize).min(n_slices);
+            let n_read = (s1 - s0).max(1);
+            let step = (n_read / MAX_SLICE_SAMPLES).max(1);
+
+            let mut run_start = 0usize;
+            let mut run_code: Option<u8> = None;
+
             for py in 0..pixels_h {
-                let frac_y = 1.0 - (py as f32 / pixels_h as f32);
-                let log_hz = log_lo + frac_y * (log_hi - log_lo);
-                let hz = 10f32.powf(log_hz);
-                let bin = ((hz / nyq) * bins as f32) as usize;
-                let bin = bin.min(bins - 1);
-                let db = slice[bin];
-                let rgba = crate::fft::db_to_rgba(db);
-                let color = Color::from_rgba(rgba[0], rgba[1], rgba[2], rgba[3]);
+                let rm = &rows[py];
+                let best = if time_interp {
+                    // Zoomed in past the slice rate: blend the two slices
+                    // this pixel falls between.
+                    let a = sample_slice(s0, rm);
+                    let b = sample_slice(s_next, rm);
+                    (a + (b - a) * s_frac).clamp(0.0, 255.0) as u8
+                } else {
+                    // Zoomed out: many slices per pixel. Reduce by MAX — a
+                    // point sample throws away everything between the
+                    // sampled slice and the next, so a transient falling in
+                    // the gap disappears, and which ones disappear changes
+                    // as you scroll, which is what makes it shimmer. Max
+                    // keeps every event that occurred in the cell.
+                    let mut best = 0u8;
+                    let mut si = s0;
+                    while si < s1 {
+                        let v = sample_slice(si, rm) as u8;
+                        if v > best {
+                            best = v;
+                        }
+                        si += step;
+                    }
+                    best
+                };
+
+                // Batch vertical runs of the same value into one rect. Large
+                // flat regions (silence, the noise floor) collapse to a
+                // handful of draws instead of one per pixel.
+                match run_code {
+                    Some(c) if c == best => {}
+                    Some(c) => {
+                        let rgba = sg.code_to_rgba(c);
+                        frame.fill_rectangle(
+                            Point::new(wx + px as f32, y + run_start as f32),
+                            Size::new(1.0, (py - run_start) as f32),
+                            Color::from_rgba(rgba[0], rgba[1], rgba[2], rgba[3]),
+                        );
+                        run_start = py;
+                        run_code = Some(best);
+                    }
+                    None => {
+                        run_start = py;
+                        run_code = Some(best);
+                    }
+                }
+            }
+            if let Some(c) = run_code {
+                let rgba = sg.code_to_rgba(c);
                 frame.fill_rectangle(
-                    Point::new(wx + px as f32, y + py as f32),
-                    Size::new(1.0, 1.0),
-                    color,
+                    Point::new(wx + px as f32, y + run_start as f32),
+                    Size::new(1.0, (pixels_h - run_start) as f32),
+                    Color::from_rgba(rgba[0], rgba[1], rgba[2], rgba[3]),
                 );
             }
         }
+    }
+
+    /// Combined PHASE view, laid out side by side:
+    ///
+    /// ```text
+    ///   ┌──────────────────────────────┬────────────┐
+    ///   │  correlation vs frequency    │ goniometer │
+    ///   └──────────────────────────────┴────────────┘
+    /// ```
+    ///
+    /// The goniometer wants to be square, so it takes a square-ish column on
+    /// the right and the frequency curve gets everything left of it — which
+    /// is what that curve wants, since it shares the spectrum line's
+    /// log-frequency x-mapping. Flipping between Spectrum and Phase keeps
+    /// frequencies in the same screen positions, so a dip you spot in one can
+    /// be looked up at the same x in the other.
+    fn draw_phase(&self, frame: &mut Frame, wx: f32, y: f32, w: f32, h: f32) {
+        // Goniometer column: square where there's room, never more than ~40%
+        // of the width (the frequency curve is the more informative panel).
+        let gonio_w = h.min(w * 0.40).max(60.0);
+        let band_w = (w - gonio_w).max(40.0);
+        self.draw_band_correlation(frame, wx, y, band_w, h);
+        self.draw_goniometer(frame, wx + band_w, y, gonio_w, h);
+        self.draw_mono_badge(frame, wx + band_w, y, gonio_w);
+    }
+
+    /// The always-on overview strip: a whole-file map that doubles as the
+    /// navigation bar.
+    ///
+    /// Its CONTENT follows the analysis mode — correlation in Phase view,
+    /// a folded waveform everywhere else — but its position, geometry and
+    /// interaction never change. That's the point: whatever you're looking
+    /// at, the bar under the waveform is always "the whole track, click to
+    /// go there".
+    fn draw_overview(&self, frame: &mut Frame, wx: f32, y: f32, w: f32, h: f32) {
+        frame.fill_rectangle(
+            Point::new(wx, y),
+            Size::new(w, h),
+            Color::from_rgb(0.05, 0.06, 0.08),
+        );
+        if self.fft_mode == 3 && self.corr_timeline.is_some() {
+            self.draw_corr_timeline(frame, wx, y, w, h);
+        } else {
+            self.draw_wave_overview(frame, wx, y, w, h);
+        }
+        // Hairline under the strip, separating it from the peak meters.
+        frame.fill_rectangle(
+            Point::new(wx, y + h - 1.0),
+            Size::new(w, 1.0),
+            Color::from_rgba(1.0, 1.0, 1.0, 0.07),
+        );
+    }
+
+    /// Whole-file waveform map, FOLDED to one side.
+    ///
+    /// A symmetric mini-waveform in a 22 px strip gives each side 11 px of
+    /// dynamic range; folding the peak magnitude upward uses the full 22.
+    /// Nothing is lost — audio is near-symmetric at this scale, and the
+    /// overview's job is structure (where the drop is, where it breaks
+    /// down), not waveshape.
+    fn draw_wave_overview(&self, frame: &mut Frame, wx: f32, y: f32, w: f32, h: f32) {
+        let env = if !self.envelope_out.is_empty() {
+            self.envelope_out
+        } else {
+            self.envelope_in
+        };
+        if env.is_empty() {
+            return;
+        }
+        let n_px = w.floor().max(1.0) as usize;
+        let base = y + h - 1.0;
+        let usable = h - 2.0;
+
+        for i in 0..n_px {
+            let e0 = i * env.len() / n_px;
+            let e1 = (((i + 1) * env.len()) / n_px).max(e0 + 1).min(env.len());
+            let mut peak = 0.0f32;
+            for &(lo, hi) in &env[e0..e1] {
+                peak = peak.max(lo.abs()).max(hi.abs());
+            }
+            if peak <= 1e-5 {
+                continue;
+            }
+            // Mild curve rather than raw amplitude. Linear amplitude in 22 px
+            // collapses everything below about -20 dBFS into the bottom two
+            // pixels, which erases exactly the quiet sections you'd navigate
+            // TO. ^0.6 lifts them without flattening the loud parts into a
+            // solid block the way a full dB mapping would.
+            let mag = peak.clamp(0.0, 1.0).powf(0.6) * usable;
+            frame.fill_rectangle(
+                Point::new(wx + i as f32, base - mag),
+                Size::new(1.0, mag.max(1.0)),
+                Color::from_rgba(0.55, 0.60, 0.70, 0.75),
+            );
+        }
+    }
+
+    /// Correlation over time: a short filled strip sharing the waveform's
+    /// time axis (so it follows zoom and scroll).
+    ///
+    /// Filled area rather than a gradient bar. On real material almost
+    /// everything sits between +0.6 and +1.0, and a colour ramp across that
+    /// range resolves to maybe four distinguishable steps — you'd get a
+    /// uniformly green bar. Height is the far better channel: a notch in a
+    /// silhouette is legible at a few pixels, and colour then reinforces it
+    /// rather than carrying the whole message alone.
+    fn draw_corr_timeline(&self, frame: &mut Frame, wx: f32, y: f32, w: f32, h: f32) {
+        use iced::widget::canvas::Text;
+        let Some(tl) = self.corr_timeline else { return };
+        if tl.points.is_empty() || tl.hop_secs <= 0.0 {
+            return;
+        }
+
+        // Non-linear y. A linear −1..+1 axis spends most of its height on a
+        // range nothing ever occupies, flattening the variation that matters
+        // into a few pixels at the top. Giving the healthy +0.5..+1.0 band
+        // 60% of the strip makes normal fluctuation actually visible. The
+        // frequency curve below stays linear, so precision is still
+        // available — this axis is for navigation, not measurement.
+        let corr_to_h = |c: f32| -> f32 {
+            let c = c.clamp(-1.0, 1.0);
+            let frac = if c >= 0.5 {
+                0.40 + (c - 0.5) / 0.5 * 0.60
+            } else {
+                (c + 1.0) / 1.5 * 0.40
+            };
+            frac * h
+        };
+
+        let n_px = w.floor().max(1.0) as usize;
+        // ALWAYS the whole file, independent of zoom and scroll. The strip's
+        // job is "where in the track should I look" — if it followed the
+        // zoom it would stop answering that the instant you zoomed in to
+        // look at something, which is exactly when you still want to know
+        // where the other problems are. The viewport box (drawn in the
+        // overlay layer) is what ties it back to the waveform above.
+        //
+        // Being zoom-independent is also what keeps this correct in the
+        // meter cache, which isn't invalidated on zoom.
+        let span = self.duration.max(1e-6);
+        for i in 0..n_px {
+            let t0 = (i as f32 / n_px as f32) * span;
+            let t1 = ((i + 1) as f32 / n_px as f32) * span;
+            // Each pixel may span many windows when zoomed out. Take the
+            // WORST correlation in range rather than the average: a two-
+            // second phase problem in a minute-wide pixel column has to
+            // survive the reduction, or the strip fails at exactly the job
+            // it exists for.
+            let i0 = (t0 / tl.hop_secs).max(0.0) as usize;
+            let i1 = ((t1 / tl.hop_secs).max(0.0) as usize + 1).min(tl.points.len());
+            if i0 >= tl.points.len() {
+                continue;
+            }
+            let mut worst = f32::MAX;
+            let mut wt = 0.0f32;
+            for p in i0..i1.max(i0 + 1).min(tl.points.len()) {
+                let (c, pw) = tl.points[p];
+                if pw <= 0.05 {
+                    continue;
+                }
+                if c < worst {
+                    worst = c;
+                }
+                if pw > wt {
+                    wt = pw;
+                }
+            }
+            if wt <= 0.05 || worst == f32::MAX {
+                continue;
+            }
+            let bar_h = corr_to_h(worst).max(1.0);
+            let (r, g, b) = corr_color_ramp(worst);
+            frame.fill_rectangle(
+                Point::new(wx + i as f32, y + h - bar_h),
+                Size::new(1.0, bar_h),
+                Color::from_rgba(r, g, b, (0.30 + 0.45 * (1.0 - worst.clamp(0.0, 1.0))) * wt),
+            );
+        }
+
+        // Reference line at the +0.5 mark — the boundary of the expanded
+        // healthy band, so the axis distortion is visible rather than
+        // silently misleading.
+        let ry = y + h - corr_to_h(0.5);
+        frame.stroke(
+            &Path::line(Point::new(wx, ry), Point::new(wx + w, ry)),
+            Stroke::default()
+                .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.12))
+                .with_width(1.0),
+        );
+
+        frame.fill_text(Text {
+            content: "correlation".to_string(),
+            position: Point::new(wx + 4.0, y + 1.0),
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.35),
+            size: 9.5.into(),
+            ..Text::default()
+        });
+    }
+
+    /// Viewport box + playhead tick over the correlation strip.
+    ///
+    /// Drawn in the OVERLAY layer, not the meter layer: these two move
+    /// constantly (every scroll, zoom and playback frame) while the strip
+    /// underneath changes only when the audio does. Splitting them along
+    /// that line is what lets the expensive goniometer stay cached while
+    /// this stays live.
+    fn draw_overview_overlay(&self, frame: &mut Frame, wx: f32, y: f32, w: f32, h: f32) {
+        if self.duration <= 0.0 {
+            return;
+        }
+        let span = self.duration.max(1e-6);
+        let to_x = |t: f32| wx + (t / span).clamp(0.0, 1.0) * w;
+
+        // Viewport box: which slice of the file the waveform above is
+        // showing. At 1x this is the full width and reads as a plain border;
+        // zoomed in it's the link between the two time axes.
+        if self.zoom > 1.001 {
+            let vx0 = to_x(self.scroll);
+            let vx1 = to_x(self.scroll + self.visible_duration());
+            // Dim the parts NOT in view rather than outlining the part that
+            // is — the eye reads "the bright bit is where I am" faster than
+            // it reads a thin rectangle.
+            let shade = Color::from_rgba(0.0, 0.0, 0.0, 0.45);
+            if vx0 > wx {
+                frame.fill_rectangle(Point::new(wx, y), Size::new(vx0 - wx, h), shade);
+            }
+            if vx1 < wx + w {
+                frame.fill_rectangle(
+                    Point::new(vx1, y),
+                    Size::new(wx + w - vx1, h),
+                    shade,
+                );
+            }
+            let box_path = Path::rectangle(
+                Point::new(vx0, y + 0.5),
+                Size::new((vx1 - vx0).max(2.0), h - 1.0),
+            );
+            frame.stroke(
+                &box_path,
+                Stroke::default()
+                    .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.55))
+                    .with_width(1.0),
+            );
+        }
+
+        // Playhead tick. `None` when nothing is loaded / no position yet.
+        if let Some(t) = self.playhead_secs {
+            let px = to_x(t);
+            frame.fill_rectangle(
+                Point::new(px - 0.5, y),
+                Size::new(1.5, h),
+                Color::from_rgba(1.0, 1.0, 1.0, 0.9),
+            );
+        }
+    }
+
+    /// Mono-fold toggle, drawn as a small badge in the goniometer's
+    /// top-right corner.
+    ///
+    /// It lives here rather than in the toolbar because it's only ever
+    /// useful next to a phase display — the curve predicts what will cancel,
+    /// this lets you hear whether it actually matters, and having the two a
+    /// few pixels apart is what makes that a fast A/B. The keyboard shortcut
+    /// (M) still works from anywhere.
+    fn draw_mono_badge(&self, frame: &mut Frame, gx: f32, gy: f32, gw: f32) {
+        use iced::widget::canvas::Text;
+        let (bx, by, bw, bh) = mono_badge_rect(gx, gy, gw);
+
+        let (bg, fg) = if self.mono_fold {
+            (
+                Color::from_rgba(0.90, 0.62, 0.22, 0.85),
+                Color::from_rgb(0.08, 0.08, 0.09),
+            )
+        } else {
+            (
+                Color::from_rgba(1.0, 1.0, 1.0, 0.07),
+                Color::from_rgba(1.0, 1.0, 1.0, 0.45),
+            )
+        };
+
+        let pill = Path::rounded_rectangle(
+            Point::new(bx, by),
+            Size::new(bw, bh),
+            3.0.into(),
+        );
+        frame.fill(&pill, bg);
+        if !self.mono_fold {
+            frame.stroke(
+                &pill,
+                Stroke::default()
+                    .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.15))
+                    .with_width(1.0),
+            );
+        }
+
+        frame.fill_text(Text {
+            content: "MONO".to_string(),
+            position: Point::new(bx + 4.0, by + 3.5),
+            color: fg,
+            size: 9.5.into(),
+            ..Text::default()
+        });
+    }
+
+    /// Correlation as a function of frequency.
+    ///
+    /// y axis is −1..+1 with zero across the middle; the curve is filled
+    /// back to that zero line — green above, red below — so negative
+    /// (mono-cancelling) regions read as red pockets hanging under the line
+    /// rather than as a number you have to interpret. The broadband
+    /// correlation is drawn as a dashed reference line across the whole
+    /// panel, so the average and the per-band deviation from it are visible
+    /// in one glance.
+    fn draw_band_correlation(&self, frame: &mut Frame, wx: f32, y: f32, w: f32, h: f32) {
+        use iced::widget::canvas::Text;
+
+        let pad_l = 26.0;
+        let pad_b = 14.0;
+        let pad_t = 18.0;
+        let px0 = wx + pad_l;
+        let plot_w = (w - pad_l - 8.0).max(1.0);
+        let py0 = y + pad_t;
+        let plot_h = (h - pad_t - pad_b).max(1.0);
+
+        let corr_to_y = |c: f32| -> f32 {
+            let t = ((c + 1.0) / 2.0).clamp(0.0, 1.0);
+            py0 + (1.0 - t) * plot_h
+        };
+        let zero_y = corr_to_y(0.0);
+
+        // ---- Resolve the curve FIRST -----------------------------------
+        // The zone tints below are keyed off how far down the curve actually
+        // goes, so the data has to be in hand before anything is drawn.
+        //
+        // Resolved per PIXEL rather than per bin. At high frequencies many
+        // bins land on one pixel (energy-weighted average here is the honest
+        // reduction); at low frequencies one bin spans several pixels and
+        // simply repeats. Cost is bounded by panel width, not FFT size.
+        let n_px = plot_w.floor().max(1.0) as usize;
+        let mut curve: Vec<Option<(f32, f32)>> = vec![None; n_px];
+        let mut have_data = false;
+        let mut min_c = 1.0f32;
+
+        let (nyq, log_lo, log_span) = if self.sample_rate > 0
+            && !self.probe_band_corr.is_empty()
+        {
+            let bins = self.probe_band_corr.len();
+            let nyq = self.sample_rate as f32 / 2.0;
+            let lo_hz = 20.0_f32.max(nyq / bins as f32);
+            let log_lo = lo_hz.log10();
+            let log_span = (nyq.log10() - log_lo).max(1e-6);
+
+            for (i, slot) in curve.iter_mut().enumerate() {
+                let f_lo = 10f32.powf(log_lo + (i as f32 / n_px as f32) * log_span);
+                let f_hi = 10f32.powf(log_lo + ((i + 1) as f32 / n_px as f32) * log_span);
+                let b_lo = ((f_lo / nyq) * bins as f32).floor().max(1.0) as usize;
+                if b_lo >= bins {
+                    continue;
+                }
+                let b_hi = (((f_hi / nyq) * bins as f32).ceil() as usize)
+                    .max(b_lo + 1)
+                    .min(bins);
+                let mut acc = 0.0f32;
+                let mut wsum = 0.0f32;
+                for b in b_lo..b_hi {
+                    let (c, wt) = self.probe_band_corr[b];
+                    acc += c * wt;
+                    wsum += wt;
+                }
+                if wsum > 1e-6 {
+                    let c = acc / wsum;
+                    let wt = (wsum / (b_hi - b_lo) as f32).clamp(0.0, 1.0);
+                    *slot = Some((c, wt));
+                    // Only bands with real signal count toward the worst
+                    // case — a faded-out dead band shouldn't summon a red
+                    // warning zone.
+                    if wt > 0.15 {
+                        have_data = true;
+                        if c < min_c {
+                            min_c = c;
+                        }
+                    }
+                }
+            }
+            (nyq, log_lo, log_span)
+        } else {
+            (0.0, 0.0, 1.0)
+        };
+        let _ = nyq;
+
+        // ---- Background -------------------------------------------------
+        // Deliberately NO horizontal zone-tint bands. Full-width stripes
+        // paint the whole panel regardless of where the data is, so they
+        // show through every gap in the fill — a narrow notch ends up
+        // looking like a coloured column punching upward, which is
+        // background leaking through, not signal. Colour belongs ON the
+        // curve (see `corr_color` below), where it only appears if there's
+        // something to report. The panel stays quiet on clean material.
+
+        // ---- Grid ------------------------------------------------------
+        for (val, label) in [(1.0, "+1"), (0.5, ""), (0.0, "0"), (-0.5, ""), (-1.0, "-1")] {
+            let yy = corr_to_y(val);
+            let alpha = if label.is_empty() { 0.05 } else { 0.18 };
+            let line = Path::line(Point::new(px0, yy), Point::new(px0 + plot_w, yy));
+            frame.stroke(
+                &line,
+                Stroke::default()
+                    .with_color(Color::from_rgba(1.0, 1.0, 1.0, alpha))
+                    .with_width(1.0),
+            );
+            if !label.is_empty() {
+                frame.fill_text(Text {
+                    content: label.to_string(),
+                    position: Point::new(wx + 4.0, yy - 6.0),
+                    color: Color::from_rgba(1.0, 1.0, 1.0, 0.45),
+                    size: 10.0.into(),
+                    ..Text::default()
+                });
+            }
+        }
+
+        if !have_data {
+            frame.fill_text(Text {
+                content: if self.probe_band_corr.is_empty() {
+                    "mono / no signal at probe".to_string()
+                } else {
+                    "no signal at probe".to_string()
+                },
+                position: Point::new(px0 + 4.0, y + 2.0),
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.45),
+                size: 12.0.into(),
+                ..Text::default()
+            });
+            return;
+        }
+
+        // Vertical frequency grid, matching the spectrum line's decades.
+        for (hz, label) in [(100.0f32, "100"), (1000.0, "1k"), (10000.0, "10k")] {
+            let frac = (hz.log10() - log_lo) / log_span;
+            if !(0.0..=1.0).contains(&frac) {
+                continue;
+            }
+            let fx = px0 + frac * plot_w;
+            let line = Path::line(Point::new(fx, py0), Point::new(fx, py0 + plot_h));
+            frame.stroke(
+                &line,
+                Stroke::default()
+                    .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.10))
+                    .with_width(1.0),
+            );
+            frame.fill_text(Text {
+                content: label.to_string(),
+                position: Point::new(fx + 2.0, py0 + plot_h + 1.0),
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.40),
+                size: 10.0.into(),
+                ..Text::default()
+            });
+        }
+
+        // ---- Fill between the curve and the zero line ------------------
+        // The fill carries the colour: green while healthy, warming through
+        // amber as it narrows, red once it goes negative. Because it's keyed
+        // to each band's own value, colour shows up exactly where the
+        // problem is and nowhere else — a clean track draws an entirely
+        // green ribbon and the rest of the panel stays dark.
+        //
+        // Alpha follows the weight so dead bands fade out instead of
+        // drawing noise.
+        for (i, slot) in curve.iter().enumerate() {
+            let Some((c, wt)) = *slot else { continue };
+            if wt <= 0.01 {
+                continue;
+            }
+            let cy = corr_to_y(c);
+            let (top, bot) = if cy < zero_y { (cy, zero_y) } else { (zero_y, cy) };
+            let (r, g, b) = corr_color_ramp(c);
+            // Negative bands get a touch more presence — that's the state
+            // worth noticing.
+            let alpha = if c < 0.0 { 0.42 } else { 0.26 } * wt;
+            frame.fill_rectangle(
+                Point::new(px0 + i as f32, top),
+                Size::new(1.0, (bot - top).max(0.5)),
+                Color::from_rgba(r, g, b, alpha),
+            );
+        }
+
+        // ---- The curve itself ------------------------------------------
+        // Broken into segments so gaps (dead bands) don't get bridged by a
+        // straight line that would imply data we don't have.
+        let mut seg: Vec<Point> = Vec::new();
+        let flush = |frame: &mut Frame, seg: &mut Vec<Point>| {
+            if seg.len() > 1 {
+                let p = Path::new(|b| {
+                    b.move_to(seg[0]);
+                    for pt in seg.iter().skip(1) {
+                        b.line_to(*pt);
+                    }
+                });
+                frame.stroke(
+                    &p,
+                    Stroke::default()
+                        .with_color(Color::from_rgba(0.55, 0.90, 1.0, 0.85))
+                        .with_width(1.4),
+                );
+            }
+            seg.clear();
+        };
+        for (i, slot) in curve.iter().enumerate() {
+            match *slot {
+                Some((c, wt)) if wt > 0.15 => {
+                    seg.push(Point::new(px0 + i as f32, corr_to_y(c)));
+                }
+                _ => flush(frame, &mut seg),
+            }
+        }
+        flush(frame, &mut seg);
+
+        // ---- Broadband reference + readout ------------------------------
+        // Seeing the average against the curve is the whole point — a +0.76
+        // average with a red pocket at 200 Hz is a different situation from
+        // a flat +0.76.
+        if let Some(corr) = self.probe_correlation {
+            // Nudge off the top edge so a +1.00 reading is still a visible
+            // line rather than disappearing into the panel border.
+            let cy = corr_to_y(corr).max(py0 + 1.0);
+            let dash = 6.0;
+            let mut x = px0;
+            while x < px0 + plot_w {
+                let x2 = (x + dash).min(px0 + plot_w);
+                let l = Path::line(Point::new(x, cy), Point::new(x2, cy));
+                frame.stroke(
+                    &l,
+                    Stroke::default()
+                        .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.35))
+                        .with_width(1.0),
+                );
+                x += dash * 2.0;
+            }
+            frame.fill_text(Text {
+                content: format!("correlation {:+.2}", corr),
+                position: Point::new(px0, y + 2.0),
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.85),
+                size: 12.0.into(),
+                ..Text::default()
+            });
+        }
+
+        // Worst-band callout. The broadband number can read +1.00 while a
+        // band sags to +0.55; naming the worst value makes that legible
+        // without having to eyeball the dip against the grid.
+        if min_c < 0.85 {
+            let col = if min_c < 0.0 {
+                Color::from_rgba(0.95, 0.45, 0.45, 0.95)
+            } else if min_c < 0.4 {
+                Color::from_rgba(0.95, 0.78, 0.35, 0.90)
+            } else {
+                Color::from_rgba(1.0, 1.0, 1.0, 0.55)
+            };
+            frame.fill_text(Text {
+                content: format!("min {:+.2}", min_c),
+                position: Point::new(px0 + 120.0, y + 2.0),
+                color: col,
+                size: 12.0.into(),
+                ..Text::default()
+            });
+        }
+
+        frame.fill_text(Text {
+            content: "correlation / frequency".to_string(),
+            position: Point::new(px0 + plot_w - 132.0, y + 2.0),
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.45),
+            size: 11.0.into(),
+            ..Text::default()
+        });
+    }
+
+    /// The old standalone correlation BAR — a horizontal −1..+1 strip with a
+    /// marker at the broadband correlation.
+    ///
+    /// RETIRED: `draw_band_correlation` subsumes it. The curve shows the same
+    /// number (as the dashed reference line) plus where it comes from, so the
+    /// bar's screen space was better spent. Kept because it's a compact
+    /// readout that might earn a place elsewhere — delete it if it hasn't
+    /// been used by the next time you're in this file.
+    #[allow(dead_code)]
+    fn draw_correlation(&self, frame: &mut Frame, wx: f32, y: f32, w: f32, h: f32) {
+        use iced::widget::canvas::Text;
+        let pad = 24.0;
+        let bar_x = wx + pad;
+        let bar_w = (w - pad * 2.0).max(1.0);
+        let bar_y = y + h * 0.5;
+        let bar_h = (h * 0.16).clamp(14.0, 48.0);
+
+        // Track background.
+        let track = Path::rectangle(
+            Point::new(bar_x, bar_y - bar_h * 0.5),
+            Size::new(bar_w, bar_h),
+        );
+        frame.fill(&track, Color::from_rgba(1.0, 1.0, 1.0, 0.06));
+
+        // Zone tints: left third (−1..−0.33) red, middle amber, right green.
+        let third = bar_w / 3.0;
+        for (i, col) in [
+            Color::from_rgba(0.85, 0.25, 0.25, 0.14),
+            Color::from_rgba(0.90, 0.65, 0.20, 0.12),
+            Color::from_rgba(0.25, 0.75, 0.40, 0.12),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let seg = Path::rectangle(
+                Point::new(bar_x + third * i as f32, bar_y - bar_h * 0.5),
+                Size::new(third, bar_h),
+            );
+            frame.fill(&seg, *col);
+        }
+
+        // Center line (0 correlation) and end ticks.
+        for (frac, label) in [(0.0, "-1"), (0.5, "0"), (1.0, "+1")] {
+            let x = bar_x + bar_w * frac;
+            let line = Path::line(
+                Point::new(x, bar_y - bar_h * 0.5 - 4.0),
+                Point::new(x, bar_y + bar_h * 0.5 + 4.0),
+            );
+            frame.stroke(
+                &line,
+                Stroke::default()
+                    .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.25))
+                    .with_width(1.0),
+            );
+            frame.fill_text(Text {
+                content: label.to_string(),
+                position: Point::new(x - 6.0, bar_y + bar_h * 0.5 + 6.0),
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.5),
+                size: 11.0.into(),
+                ..Text::default()
+            });
+        }
+
+        // The correlation marker.
+        if let Some(corr) = self.probe_correlation {
+            let frac = (corr + 1.0) / 2.0; // −1..1 -> 0..1
+            let x = bar_x + bar_w * frac;
+            let col = if corr < -0.1 {
+                Color::from_rgb(0.95, 0.35, 0.35)
+            } else if corr < 0.4 {
+                Color::from_rgb(0.95, 0.75, 0.30)
+            } else {
+                Color::from_rgb(0.40, 0.90, 0.55)
+            };
+            let marker = Path::rectangle(
+                Point::new(x - 2.0, bar_y - bar_h * 0.5 - 6.0),
+                Size::new(4.0, bar_h + 12.0),
+            );
+            frame.fill(&marker, col);
+            // Numeric readout.
+            frame.fill_text(Text {
+                content: format!("correlation {:+.2}", corr),
+                position: Point::new(bar_x, y + 2.0),
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.85),
+                size: 13.0.into(),
+                ..Text::default()
+            });
+        } else {
+            frame.fill_text(Text {
+                content: "no signal at probe".to_string(),
+                position: Point::new(bar_x, y + 2.0),
+                color: Color::from_rgba(1.0, 1.0, 1.0, 0.45),
+                size: 13.0.into(),
+                ..Text::default()
+            });
+        }
+    }
+
+    /// Goniometer: plot the probe window's L/R as a rotated X/Y figure. The
+    /// axes are rotated 45° so mono (L==R) draws as a VERTICAL line and a
+    /// phase-inverted signal (L==−R) draws HORIZONTAL — the standard studio
+    /// vectorscope orientation.
+    fn draw_goniometer(&self, frame: &mut Frame, wx: f32, y: f32, w: f32, h: f32) {
+        use iced::widget::canvas::Text;
+        let cx = wx + w * 0.5;
+        let cy = y + h * 0.5;
+        let radius = (h * 0.5 - 14.0).min(w * 0.5 - 14.0).max(8.0);
+
+        // Reference circle + crosshair.
+        let circle = Path::circle(Point::new(cx, cy), radius);
+        frame.stroke(
+            &circle,
+            Stroke::default()
+                .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.12))
+                .with_width(1.0),
+        );
+        for (dx, dy, lbl) in [
+            (0.0, -1.0, "M"),  // vertical = mono
+            (1.0, 0.0, "+S"),  // right = side
+            (-1.0, 0.0, "-S"), // left
+        ] {
+            let line = Path::line(
+                Point::new(cx, cy),
+                Point::new(cx + dx * radius, cy + dy * radius),
+            );
+            frame.stroke(
+                &line,
+                Stroke::default()
+                    .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.08))
+                    .with_width(1.0),
+            );
+            let _ = lbl;
+        }
+
+        // Plot points. Rotate (L,R) by −45°: x = (L−R)/√2 (side), y = (L+R)/√2
+        // (mid). Screen y is inverted (down = positive), so mid points up.
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        for &(l, r) in self.probe_gonio.iter() {
+            let side = (l - r) * s;
+            let mid = (l + r) * s;
+            let px = cx + side * radius;
+            let py = cy - mid * radius;
+            let dot = Path::circle(Point::new(px, py), 1.2);
+            frame.fill(&dot, Color::from_rgba(0.45, 0.85, 0.95, 0.5));
+        }
+
+        // Label only — the correlation number lives on the frequency panel
+        // to the left, next to the dashed line that shows the same value.
+        frame.fill_text(Text {
+            content: "goniometer".to_string(),
+            position: Point::new(wx + 6.0, y + 2.0),
+            color: Color::from_rgba(1.0, 1.0, 1.0, 0.45),
+            size: 11.0.into(),
+            ..Text::default()
+        });
     }
 }
 
@@ -1849,6 +2840,34 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
                 )
             }
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
+                // The mono badge sits in the FFT panel, BELOW the wave area,
+                // so it has to be tested before the `in_wave` gate rejects
+                // everything down there.
+                // Correlation overview strip: click to navigate. Tested
+                // before the `in_wave` gate, since the strip lives below the
+                // wave area.
+                if let Some((sx, sy, sw, sh)) =
+                    self.overview_rect(bounds.width, bounds.height)
+                {
+                    if pos.x >= sx
+                        && pos.x <= sx + sw
+                        && pos.y >= sy
+                        && pos.y <= sy + sh
+                    {
+                        state.dragging_overview = true;
+                        let frac = ((pos.x - sx) / sw.max(1.0)).clamp(0.0, 1.0);
+                        return (
+                            canvas::event::Status::Captured,
+                            Some(CanvasEvent::NavigateTo(frac * self.duration)),
+                        );
+                    }
+                }
+                if self.mono_badge_hit(bounds.width, bounds.height, pos.x, pos.y) {
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(CanvasEvent::ToggleMonoFold),
+                    );
+                }
                 if !in_wave {
                     return (canvas::event::Status::Ignored, None);
                 }
@@ -1927,6 +2946,17 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
                 )
             }
             canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) => {
+                if state.dragging_overview {
+                    if let Some((sx, _sy, sw, _sh)) =
+                        self.overview_rect(bounds.width, bounds.height)
+                    {
+                        let frac = ((pos.x - sx) / sw.max(1.0)).clamp(0.0, 1.0);
+                        return (
+                            canvas::event::Status::Captured,
+                            Some(CanvasEvent::NavigateTo(frac * self.duration)),
+                        );
+                    }
+                }
                 if let Some(handle) = state.dragging_trim {
                     // Clamp to the visible time domain; cross-constraint and
                     // edge clamp to [0, duration] are enforced app-side.
@@ -1986,6 +3016,7 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
                 state.dragging = None;
                 state.dragging_guide = false;
                 state.dragging_trim = None;
+                state.dragging_overview = false;
                 (canvas::event::Status::Captured, None)
             }
             _ => (canvas::event::Status::Ignored, None),
@@ -2033,12 +3064,19 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
 
             // Bottom strip background (under both meters + FFT panel) so the
             // meter_cache layer can paint on top of a stable backdrop.
-            let meter_y = total_h - self.bottom_inset_h(total_h);
+            let meter_y = self.meter_y(total_h);
             frame.fill_rectangle(
                 Point::new(wx, meter_y),
                 Size::new(ww, total_h - meter_y),
                 Color::from_rgb(0.05, 0.06, 0.08),
             );
+
+            // Overview strip: whole-file, so it belongs in the static layer
+            // alongside the spectrogram. Zoom-independent by design, which
+            // is what makes it safe here — this cache isn't rebuilt on zoom.
+            if let Some((sx, sy, sw, sh)) = self.overview_rect(total_w, total_h) {
+                self.draw_overview(frame, sx, sy, sw, sh);
+            }
 
             // Spectrogram is in the static layer because it covers the whole
             // file and only changes when the audio changes.
@@ -2058,13 +3096,20 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
             let total_w = frame.width();
             let total_h = frame.height();
             let (wx, _wy, ww, _wh) = self.wave_area(total_w, total_h);
-            let meter_y = total_h - self.bottom_inset_h(total_h);
+            let meter_y = self.meter_y(total_h);
             self.draw_peak_meters(frame, wx, meter_y, ww);
             if self.fft_mode == 1 {
                 let fft_y = meter_y + 18.0;
                 let fft_h = total_h - fft_y;
                 if fft_h > 10.0 {
                     self.draw_spectrum_line(frame, wx, fft_y, ww, fft_h);
+                }
+            }
+            if self.fft_mode == 3 {
+                let fft_y = meter_y + 18.0;
+                let fft_h = total_h - fft_y;
+                if fft_h > 10.0 {
+                    self.draw_phase(frame, wx, fft_y, ww, fft_h);
                 }
             }
         });
@@ -2074,6 +3119,10 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
             let total_w = frame.width();
             let total_h = frame.height();
             let (wx, wy, ww, wh) = self.wave_area(total_w, total_h);
+
+            if let Some((sx, sy, sw, sh)) = self.overview_rect(total_w, total_h) {
+                self.draw_overview_overlay(frame, sx, sy, sw, sh);
+            }
 
             if let Some(t) = self.hover_secs {
                 let x = wx + self.t_to_x(t, ww);
@@ -2099,6 +3148,45 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
                     }
                 }
             }
+            // Detected-click markers: short amber ticks at the top of the
+            // wave area so the user can spot clicks (even invisible ones).
+            // The currently-navigated click is drawn brighter/full-strength.
+            if !self.detected_clicks.is_empty() && self.sample_rate > 0 {
+                let sr = self.sample_rate as f32;
+                for (i, &frame_idx) in self.detected_clicks.iter().enumerate() {
+                    let t = frame_idx as f32 / sr;
+                    let x = wx + self.t_to_x(t, ww);
+                    if x >= wx && x <= wx + ww {
+                        let is_current = self.current_click == Some(i);
+                        let (tick_w, tick_a, line_a) = if is_current {
+                            (2.5, 1.0, 0.5)
+                        } else {
+                            (2.0, 0.85, 0.22)
+                        };
+                        let tick = Path::line(
+                            Point::new(x, wy),
+                            Point::new(x, wy + if is_current { 18.0 } else { 12.0 }),
+                        );
+                        frame.stroke(
+                            &tick,
+                            Stroke::default()
+                                .with_color(Color::from_rgba(1.0, 0.65, 0.15, tick_a))
+                                .with_width(tick_w),
+                        );
+                        let full = Path::line(
+                            Point::new(x, wy),
+                            Point::new(x, wy + wh),
+                        );
+                        frame.stroke(
+                            &full,
+                            Stroke::default()
+                                .with_color(Color::from_rgba(1.0, 0.65, 0.15, line_a))
+                                .with_width(1.0),
+                        );
+                    }
+                }
+            }
+
             if let Some(t) = self.playhead_secs {
                 let x = wx + self.t_to_x(t, ww);
                 if x >= wx && x <= wx + ww {
@@ -2186,6 +3274,8 @@ pub struct DragState {
     pub dragging_guide: bool,
     /// Which trim handle is being dragged, if any.
     pub dragging_trim: Option<TrimHandle>,
+    /// True while scrubbing the correlation overview strip.
+    pub dragging_overview: bool,
 }
 
 /// Which trim boundary a drag is moving.

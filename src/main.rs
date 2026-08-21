@@ -37,7 +37,7 @@ use dsp::ClipperType;
 use iced::time;
 use iced::widget::{
     button, canvas, column, container, horizontal_rule, mouse_area, pick_list, row, slider, stack,
-    svg, text, Space,
+    svg, text, text_input, Space,
 };
 use iced::{Color, Element, Length, Point, Rectangle, Renderer, Size, Subscription, Task, Theme};
 use playback::{Player, Source};
@@ -53,26 +53,71 @@ enum SpectrumMode {
     Off,
     Spectrum,
     Spectrogram,
+    Phase,
 }
 
 impl SpectrumMode {
+    /// All selectable modes, in display order (for the mode-selector row).
+    const ALL: [Self; 4] = [
+        Self::Off,
+        Self::Spectrum,
+        Self::Spectrogram,
+        Self::Phase,
+    ];
     fn next(self) -> Self {
         match self {
             SpectrumMode::Off => SpectrumMode::Spectrum,
             SpectrumMode::Spectrum => SpectrumMode::Spectrogram,
-            SpectrumMode::Spectrogram => SpectrumMode::Off,
+            SpectrumMode::Spectrogram => SpectrumMode::Phase,
+            SpectrumMode::Phase => SpectrumMode::Off,
         }
     }
+    /// Long label with the "FFT:" prefix. Currently unused — kept because
+    /// it's the right string if a status-bar readout of the active mode is
+    /// ever wanted. (`menu_label` is what the View dropdown shows.)
+    #[allow(dead_code)]
     fn label(self) -> &'static str {
         match self {
             SpectrumMode::Off => "FFT: Off",
             SpectrumMode::Spectrum => "FFT: Spectrum",
             SpectrumMode::Spectrogram => "FFT: Spectrogram",
+            SpectrumMode::Phase => "Phase",
+        }
+    }
+    /// Short label for the mode-selector row (placeholder until icons).
+    #[allow(dead_code)]
+    fn short_label(self) -> &'static str {
+        match self {
+            SpectrumMode::Off => "Off",
+            SpectrumMode::Spectrum => "Spec",
+            SpectrumMode::Spectrogram => "Sgram",
+            SpectrumMode::Phase => "Phase",
+        }
+    }
+    /// Full label for the View dropdown's radio rows. Unlike `label()` this
+    /// carries no "FFT:" prefix — the menu section caption already says
+    /// what the group is.
+    fn menu_label(self) -> &'static str {
+        match self {
+            SpectrumMode::Off => "Off",
+            SpectrumMode::Spectrum => "Spectrum",
+            SpectrumMode::Spectrogram => "Spectrogram",
+            SpectrumMode::Phase => "Phase",
         }
     }
 }
 
 const ENVELOPE_WIDTH: usize = 2000; // resolution for the rendered envelope arrays
+
+/// Left inset of the View dropdown, so it hangs under the eyeball button.
+///
+/// The toolbar row has 8px padding and 8px spacing, and each icon button is
+/// 16px of icon + 8px padding either side = 32px wide. The eyeball is the
+/// third button (burger, zero-crossing, eyeball), so:
+///   8 (row pad) + 32 + 8 + 32 + 8 = 88.
+/// Adjust if the toolbar order before the eyeball changes.
+const VIEW_MENU_LEFT: u16 = 88;
+const VIEW_MENU_WIDTH: u16 = 252;
 
 /// Embedded SVG icon data — baked into the binary so the app stays a single
 /// portable executable.
@@ -88,11 +133,16 @@ const ICON_PAUSE: &[u8] = include_bytes!("../assets/icons/media-playback-pause.s
 const ICON_MENU: &[u8] = include_bytes!("../assets/icons/menu.svg");
 // Pulled-out menu items, now living in the top bar as icons.
 const ICON_ZERO_CROSSING: &[u8] = include_bytes!("../assets/icons/zero-crossing.svg");
-const ICON_REDUCTION: &[u8] = include_bytes!("../assets/icons/reduction.svg");
-const ICON_GUIDES: &[u8] = include_bytes!("../assets/icons/guides.svg");
 const ICON_SETTINGS: &[u8] = include_bytes!("../assets/icons/settings.svg");
-// FFT / spectrogram view cycle (Off → Spectrum → Spectrogram).
-const ICON_FFT_VIEW: &[u8] = include_bytes!("../assets/icons/view.svg");
+// "View" dropdown (eyeball). Opens the display menu: analysis-panel mode
+// (radio) + overlay toggles (checkboxes).
+//
+// NOTE: this REPLACED three separate toolbar toggles — reduction.svg,
+// guides.svg and view.svg (the old FFT-cycle button). Those asset files are
+// still on disk but no longer compiled in; the toggles they drove now live
+// as rows in the View menu. Delete the files if you want the assets folder
+// tidy, or leave them for a future re-use.
+const ICON_EYE: &[u8] = include_bytes!("../assets/icons/eye.svg");
 // Small scissors glyph shown in front of the trim readout (not a button).
 const ICON_SCISSORS: &[u8] = include_bytes!("../assets/icons/scissors.svg");
 // Small arrow shown between the trim start and end times.
@@ -520,6 +570,25 @@ struct App {
     /// that sample instead of the normal seek/select interaction. Toggled by
     /// the "Click Repair" button in the FIX tab.
     click_repair_mode: bool,
+    /// Frame indices of clicks found by the "Scan for clicks" detector. Drawn
+    /// as markers on the waveform so the user can find and (manually) heal
+    /// them. Detection only — never auto-fixes.
+    detected_clicks: Vec<usize>,
+    /// Index into detected_clicks of the currently-navigated click (for the
+    /// prev/next arrows). None until the user steps through them.
+    current_click: Option<usize>,
+    /// Click-detection sensitivity, 0..1 (higher = more/subtler detections).
+    click_sensitivity: f32,
+    /// True once the user has run a click scan (so the sensitivity slider
+    /// re-scans live even after markers are cleared to zero).
+    click_scan_active: bool,
+    /// Path of the most recently exported file. Enables the post-export
+    /// "Send to <external tool>" picker (settings.external_tools).
+    last_exported: Option<PathBuf>,
+    /// When `Some`, the post-export confirmation modal is showing (holds the
+    /// exported path). Confirms the save, shows the location, and offers the
+    /// send-to-external-tool buttons.
+    export_confirm: Option<PathBuf>,
     /// Cached input peak (dBFS) of the selected zone, for the Ceiling
     /// slider's peak marker. Recomputed on zone switch / file load /
     /// input-gain change (input gain shifts the peak the clipper sees).
@@ -560,6 +629,21 @@ struct App {
     /// The probe frame the cached spectrum lines were computed at, so we can
     /// detect when the probe moved enough to warrant a recompute.
     spectrum_line_frame: Option<usize>,
+    /// Cached stereo correlation (-1..1) at the probe point, for the
+    /// Correlation analysis mode. None on mono files / until computed.
+    probe_correlation: Option<f32>,
+    /// Cached goniometer points (downsampled L/R pairs) at the probe point,
+    /// for the Goniometer analysis mode.
+    probe_gonio: Vec<(f32, f32)>,
+    /// Monitor the mono sum instead of stereo. Monitoring only — never
+    /// affects analysis, rendering or export.
+    mono_fold: bool,
+    /// Whole-file correlation over time, computed from the PROCESSED buffer.
+    /// `None` = not computed yet (lazy: only built when Phase mode is on).
+    corr_timeline: Option<Arc<fft::CorrTimeline>>,
+    /// Per-frequency stereo correlation at the probe: one `(corr, weight)`
+    /// per FFT bin. Empty for mono files or when there's no signal.
+    probe_band_corr: Vec<(f32, f32)>,
     /// Smoothed peak meter values, in linear amplitude [0..1+]. Decayed on
     /// each Tick toward the latest sample.
     meter_in: f32,
@@ -574,6 +658,9 @@ struct App {
     history_pos: usize,
     /// Whether the File menu is currently open (drop-down visible).
     file_menu_open: bool,
+    /// Whether the View menu (eyeball dropdown) is open. Mutually exclusive
+    /// with `file_menu_open` — opening either closes the other.
+    view_menu_open: bool,
     menu_close_abort: Option<iced::task::Handle>,
     recent_files: recent::RecentFiles,
     /// Optional draggable horizontal guide line, in dB (negative). None = hidden.
@@ -833,6 +920,22 @@ enum Msg {
     /// Toggle the per-zone DC blocker (one-pole high-pass).
     ToggleDcBlocker,
     ToggleClickRepair,
+    /// Scan the whole file for clicks and mark them (detection only).
+    ScanForClicks,
+    /// Adjust click-detection sensitivity (re-scans live if a scan is active).
+    SetClickSensitivity(f32),
+    /// Clear the click-detection markers.
+    ClearClickMarkers,
+    /// Center the view on the detected click at this index in detected_clicks.
+    JumpToClick(usize),
+    /// Step to the previous / next detected click and move the cursor there.
+    PrevClick,
+    NextClick,
+    /// Send the last-exported file to the configured external tool at this
+    /// index in settings.external_tools.
+    SendToTool(usize),
+    /// Dismiss the post-export confirmation modal.
+    CloseExportConfirm,
     /// Set DC blocker cutoff frequency in Hz.
     SetDcBlockerHz(f32),
     /// Bake the current processed output into the input — "Apply".
@@ -847,6 +950,11 @@ enum Msg {
     /// Raw keyboard event — bindings lookup happens in update().
     KeyPressed(iced::keyboard::Key, iced::keyboard::Modifiers),
     ToggleSource,    // A/B
+    ToggleMonoFold,  // monitor the L+R sum
+    SetSpectrogramFftSize(usize),
+    CorrTimelineDone(Arc<fft::CorrTimeline>),
+    PrevCorrDip,
+    NextCorrDip,
     Tick,            // ~30Hz, advances playhead display
     // Zone nav
     PrevZone,
@@ -869,6 +977,8 @@ enum Msg {
     Commit,
     // FFT
     CycleSpectrumMode,
+    /// Directly select an analysis-panel mode (from the mode-selector row).
+    SetSpectrumMode(SpectrumMode),
     SpectrogramInDone(Arc<fft::Spectrogram>),
     SpectrogramOutDone(Arc<fft::Spectrogram>),
     // Menu
@@ -878,6 +988,13 @@ enum Msg {
     MenuMouseExit,
     /// Mouse re-entered the menu — cancel the pending close.
     MenuMouseEnter,
+    // View menu (eyeball dropdown: panel mode radio + overlay checkboxes)
+    ToggleViewMenu,
+    CloseViewMenu,
+    /// Mouse left the View menu — schedule a delayed close.
+    ViewMenuMouseExit,
+    /// Mouse re-entered the View menu — cancel the pending close.
+    ViewMenuMouseEnter,
     // Guide line
     ToggleGuide,
     SetGuideDb(f32),
@@ -928,6 +1045,12 @@ enum Msg {
     PickDefaultExportDir,
     DraftSetOpenDir(Option<PathBuf>),
     DraftSetExportDir(Option<PathBuf>),
+    /// External-tools editor (Settings): add a blank tool, remove tool[i],
+    /// edit tool[i]'s name or command.
+    DraftAddTool,
+    DraftRemoveTool(usize),
+    DraftSetToolName(usize, String),
+    DraftSetToolCommand(usize, String),
     SaveSettings,
 }
 
@@ -975,6 +1098,12 @@ impl App {
                 selected_zone: Some(0),
                 active_tab: ControlTab::Clipper,
                 click_repair_mode: false,
+                detected_clicks: Vec::new(),
+                current_click: None,
+                click_sensitivity: 0.75,
+                click_scan_active: false,
+                last_exported: None,
+                export_confirm: None,
                 zone_input_peak_db: None,
                 cursor_time: None,
                 status,
@@ -991,6 +1120,11 @@ impl App {
                 spectrogram_in: None,
                 spectrogram_out: None,
                 spectrum_line_out: None,
+                probe_correlation: None,
+                probe_gonio: Vec::new(),
+                probe_band_corr: Vec::new(),
+                mono_fold: false,
+                corr_timeline: None,
                 spectrum_line_in: None,
                 spectrum_line_frame: None,
                 meter_in: 0.0,
@@ -998,6 +1132,7 @@ impl App {
                 history: vec![HistoryEntry::ParamChange(ZoneMap::new())],
                 history_pos: 0,
                 file_menu_open: false,
+                view_menu_open: false,
                 menu_close_abort: None,
                 recent_files: recent::RecentFiles::load(),
                 guide_db: None,
@@ -1304,6 +1439,7 @@ impl App {
                 self.history_pos = 0;
                 self.spectrogram_in = None;
                 self.spectrogram_out = None;
+                self.corr_timeline = None;
                 self.invalidate_spectrum_line();
                 // Spawn spectrograms only if the user is currently looking
                 // at the spectrogram view; otherwise wait until they ask.
@@ -1416,6 +1552,10 @@ impl App {
                 self.status = format!("Exported {}", p.display());
                 self.recent_files.push(&p);
                 self.recent_files.save();
+                self.last_exported = Some(p.clone());
+                // Surface the post-export confirmation modal (shows location +
+                // send-to tools).
+                self.export_confirm = Some(p);
                 Task::none()
             }
             Msg::Saved(Err(e)) => {
@@ -1466,6 +1606,10 @@ impl App {
                         }
                         // Parking the playhead = moving the probe point.
                         self.refresh_spectrum_line();
+                        self.refresh_stereo_meters();
+                    }
+                    CanvasEvent::NavigateTo(t) => {
+                        self.navigate_to(t);
                     }
                     CanvasEvent::MoveSplit(i, t) => {
                         let lo = if i == 0 { 0.0 } else { self.zones.splits[i - 1] + 1e-3 };
@@ -1528,6 +1672,15 @@ impl App {
                             self.cursor_time = t;
                             self.overlay_cache.clear();
                         }
+                    }
+                    CanvasEvent::ToggleMonoFold => {
+                        self.mono_fold = !self.mono_fold;
+                        if let Some(p) = &self.player {
+                            p.set_mono_fold(self.mono_fold);
+                        }
+                        // The badge lives in the meter layer, so that cache
+                        // has to be dropped for the lit state to repaint.
+                        self.meter_cache.clear();
                     }
                     CanvasEvent::DragGuide(db) => {
                         let clamped = db.clamp(-60.0, 0.0);
@@ -1701,6 +1854,100 @@ impl App {
                 self.canvas_cache.clear();
                 Task::none()
             }
+            Msg::ScanForClicks => {
+                if self.input.is_none() {
+                    self.status = "Load a file first.".into();
+                    return Task::none();
+                }
+                let clicks = self.scan_clicks(self.click_sensitivity);
+                let n = clicks.len();
+                self.detected_clicks = clicks;
+                self.current_click = if n > 0 { Some(0) } else { None };
+                self.click_scan_active = true;
+                self.canvas_cache.clear();
+                self.status = if n == 0 {
+                    "Scan complete: no clicks detected.".into()
+                } else {
+                    format!("Scan complete: {n} potential click(s) marked.")
+                };
+                Task::none()
+            }
+            Msg::SetClickSensitivity(s) => {
+                self.click_sensitivity = s.clamp(0.0, 1.0);
+                // Live re-scan so the marker count updates as the slider moves
+                // (only if a scan has already been run — don't auto-scan a
+                // fresh file just from touching the slider).
+                if !self.detected_clicks.is_empty() || self.click_scan_active {
+                    let clicks = self.scan_clicks(self.click_sensitivity);
+                    let n = clicks.len();
+                    self.detected_clicks = clicks;
+                    self.current_click = if n > 0 { Some(0) } else { None };
+                    self.canvas_cache.clear();
+                    self.status = format!("{n} potential click(s) at this sensitivity.");
+                }
+                Task::none()
+            }
+            Msg::ClearClickMarkers => {
+                self.detected_clicks.clear();
+                self.current_click = None;
+                self.click_scan_active = false;
+                self.canvas_cache.clear();
+                self.status = "Cleared click markers.".into();
+                Task::none()
+            }
+            Msg::JumpToClick(idx) => {
+                self.jump_to_click(idx);
+                Task::none()
+            }
+            Msg::PrevClick => {
+                let n = self.detected_clicks.len();
+                if n > 0 {
+                    let cur = self.current_click.unwrap_or(0);
+                    self.jump_to_click(cur.saturating_sub(1));
+                }
+                Task::none()
+            }
+            Msg::NextClick => {
+                let n = self.detected_clicks.len();
+                if n > 0 {
+                    let cur = self.current_click.unwrap_or(0);
+                    self.jump_to_click((cur + 1).min(n - 1));
+                }
+                Task::none()
+            }
+            Msg::CloseExportConfirm => {
+                self.export_confirm = None;
+                Task::none()
+            }
+            Msg::SendToTool(idx) => {
+                let Some(path) = self.last_exported.clone() else {
+                    self.status = "Nothing exported yet to send.".into();
+                    return Task::none();
+                };
+                let Some(tool) = self.settings.external_tools.get(idx).cloned() else {
+                    return Task::none();
+                };
+                let path_str = path.to_string_lossy().to_string();
+                match tool.resolve(&path_str) {
+                    Some((program, args)) => {
+                        // Fire-and-forget: spawn detached so export/UI isn't
+                        // blocked. We don't wait on or reap the child.
+                        match std::process::Command::new(&program).args(&args).spawn() {
+                            Ok(_) => {
+                                self.status = format!("Sent to {}", tool.name);
+                            }
+                            Err(e) => {
+                                self.status =
+                                    format!("Couldn't launch {}: {}", tool.name, e);
+                            }
+                        }
+                    }
+                    None => {
+                        self.status = format!("{}: empty command", tool.name);
+                    }
+                }
+                Task::none()
+            }
             Msg::SetDcBlockerHz(hz) => {
                 if let Some(z) = self.current_zone_mut() {
                     z.dc_blocker_hz = hz.clamp(5.0, 60.0);
@@ -1739,6 +1986,48 @@ impl App {
                 self.overlay_cache.clear();
                 Task::none()
             }
+            Msg::PrevCorrDip => {
+                self.jump_to_dip(false);
+                Task::none()
+            }
+            Msg::NextCorrDip => {
+                self.jump_to_dip(true);
+                Task::none()
+            }
+            Msg::SetSpectrogramFftSize(n) => {
+                if self.settings.spectrogram_fft_size == n {
+                    return Task::none();
+                }
+                self.settings.spectrogram_fft_size = n;
+                self.settings.save();
+                // Both spectrograms are now stale.
+                self.spectrogram_in = None;
+                self.spectrogram_out = None;
+                self.canvas_cache.clear();
+                if self.spectrum_mode == SpectrumMode::Spectrogram {
+                    return Task::batch(vec![
+                        self.spawn_spectrogram_in(),
+                        self.spawn_spectrogram_out(),
+                    ]);
+                }
+                Task::none()
+            }
+            Msg::CorrTimelineDone(tl) => {
+                self.corr_timeline = Some(tl);
+                // The overview strip lives in the static layer.
+                self.canvas_cache.clear();
+                Task::none()
+            }
+            Msg::ToggleMonoFold => {
+                self.mono_fold = !self.mono_fold;
+                if let Some(p) = &self.player {
+                    p.set_mono_fold(self.mono_fold);
+                }
+                // Repaint the goniometer badge (M works from anywhere, not
+                // just by clicking the badge itself).
+                self.meter_cache.clear();
+                Task::none()
+            }
             Msg::ToggleSource => {
                 if let Some(p) = &self.player {
                     let new = match p.current_source() {
@@ -1761,6 +2050,10 @@ impl App {
                     KeyAction::AddSplit => Msg::AddSplitAtCursor,
                     KeyAction::ToggleSnap => Msg::ToggleSnap,
                     KeyAction::ToggleReduction => Msg::ToggleReduction,
+                    KeyAction::ToggleGuideLine => Msg::ToggleGuide,
+                    KeyAction::ToggleMonoFold => Msg::ToggleMonoFold,
+                    KeyAction::PrevCorrDip => Msg::PrevCorrDip,
+                    KeyAction::NextCorrDip => Msg::NextCorrDip,
                     KeyAction::CycleFft => Msg::CycleSpectrumMode,
                     KeyAction::ZoomIn => Msg::ZoomIn,
                     KeyAction::ZoomOut => Msg::ZoomOut,
@@ -1808,6 +2101,7 @@ impl App {
                 // the probe moved enough).
                 if probe_moved {
                     self.refresh_spectrum_line();
+                    self.refresh_stereo_meters();
                 }
                 Task::none()
             }
@@ -1915,6 +2209,9 @@ impl App {
                         self.canvas_cache.clear();
                         // Output changed → invalidate output spectrogram.
                         self.spectrogram_out = None;
+                        // ...and the correlation timeline, which is measured
+                        // on the processed buffer.
+                        self.corr_timeline = None;
                         // Output audio changed → recompute the probe-point
                         // spectrum line so the overlay reflects the new
                         // processing (this is the "recompute on processing
@@ -1923,6 +2220,9 @@ impl App {
                         self.refresh_spectrum_line();
                         if self.spectrum_mode == SpectrumMode::Spectrogram {
                             return self.spawn_spectrogram_out();
+                        }
+                        if self.spectrum_mode == SpectrumMode::Phase {
+                            return self.spawn_corr_timeline();
                         }
                     }
                 }
@@ -1978,25 +2278,11 @@ impl App {
             }
             Msg::CycleSpectrumMode => {
                 self.spectrum_mode = self.spectrum_mode.next();
-                self.canvas_cache.clear();
-                self.meter_cache.clear();
-                if self.spectrum_mode == SpectrumMode::Spectrum {
-                    // Compute the probe-point lines now so the view isn't blank.
-                    self.refresh_spectrum_line();
-                }
-                if self.spectrum_mode == SpectrumMode::Spectrogram {
-                    let mut tasks = Vec::new();
-                    if self.spectrogram_in.is_none() {
-                        tasks.push(self.spawn_spectrogram_in());
-                    }
-                    if self.spectrogram_out.is_none() {
-                        tasks.push(self.spawn_spectrogram_out());
-                    }
-                    if !tasks.is_empty() {
-                        return Task::batch(tasks);
-                    }
-                }
-                Task::none()
+                return self.on_spectrum_mode_changed();
+            }
+            Msg::SetSpectrumMode(mode) => {
+                self.spectrum_mode = mode;
+                return self.on_spectrum_mode_changed();
             }
             Msg::SpectrogramInDone(sg) => {
                 self.spectrogram_in = Some(sg);
@@ -2010,6 +2296,7 @@ impl App {
             }
             Msg::ToggleFileMenu => {
                 self.file_menu_open = !self.file_menu_open;
+                self.view_menu_open = false;
                 // Cancel any pending close from a previous open.
                 if let Some(h) = self.menu_close_abort.take() {
                     h.abort();
@@ -2019,6 +2306,41 @@ impl App {
             Msg::CloseFileMenu => {
                 self.file_menu_open = false;
                 self.menu_close_abort = None;
+                Task::none()
+            }
+            Msg::ToggleViewMenu => {
+                self.view_menu_open = !self.view_menu_open;
+                self.file_menu_open = false;
+                if let Some(h) = self.menu_close_abort.take() {
+                    h.abort();
+                }
+                Task::none()
+            }
+            Msg::CloseViewMenu => {
+                self.view_menu_open = false;
+                self.menu_close_abort = None;
+                Task::none()
+            }
+            Msg::ViewMenuMouseExit => {
+                // Same delayed-close as the file menu: 300 ms grace so a
+                // brief slip off the menu doesn't dismiss it.
+                if let Some(h) = self.menu_close_abort.take() {
+                    h.abort();
+                }
+                let close_task = Task::perform(
+                    async {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    },
+                    |_| Msg::CloseViewMenu,
+                );
+                let (task, handle) = Task::abortable(close_task);
+                self.menu_close_abort = Some(handle);
+                task
+            }
+            Msg::ViewMenuMouseEnter => {
+                if let Some(h) = self.menu_close_abort.take() {
+                    h.abort();
+                }
                 Task::none()
             }
             Msg::MenuMouseExit => {
@@ -2354,6 +2676,7 @@ impl App {
                 self.history_pos = 0;
                 self.spectrogram_in = None;
                 self.spectrogram_out = None;
+                self.corr_timeline = None;
                 self.invalidate_spectrum_line();
 
                 // Run the initial DSP synchronously.
@@ -2534,6 +2857,39 @@ impl App {
                 }
                 Task::none()
             }
+            Msg::DraftAddTool => {
+                if let Some(d) = &mut self.settings_draft {
+                    d.external_tools.push(settings::ExternalTool {
+                        name: "New tool".to_string(),
+                        command: "program %f".to_string(),
+                    });
+                }
+                Task::none()
+            }
+            Msg::DraftRemoveTool(i) => {
+                if let Some(d) = &mut self.settings_draft {
+                    if i < d.external_tools.len() {
+                        d.external_tools.remove(i);
+                    }
+                }
+                Task::none()
+            }
+            Msg::DraftSetToolName(i, name) => {
+                if let Some(d) = &mut self.settings_draft {
+                    if let Some(t) = d.external_tools.get_mut(i) {
+                        t.name = name;
+                    }
+                }
+                Task::none()
+            }
+            Msg::DraftSetToolCommand(i, cmd) => {
+                if let Some(d) = &mut self.settings_draft {
+                    if let Some(t) = d.external_tools.get_mut(i) {
+                        t.command = cmd;
+                    }
+                }
+                Task::none()
+            }
             Msg::SaveSettings => {
                 if let Some(draft) = self.settings_draft.take() {
                     self.settings = draft;
@@ -2547,6 +2903,107 @@ impl App {
 
     /// Zoom by `factor` keeping the playhead position fixed in the view
     /// (or centered if no file/playhead).
+    /// Move the playhead to `t` AND bring the zoomed view with it.
+    ///
+    /// Used by the correlation overview strip, which always shows the whole
+    /// file: its target is usually outside the current view, so a plain seek
+    /// would drop the playhead somewhere off-screen. Centers the view on the
+    /// target when zoomed; at 1x the scroll clamp makes the centering a
+    /// no-op, so the same path serves both cases.
+    fn navigate_to(&mut self, t: f32) {
+        let dur = self
+            .input
+            .as_ref()
+            .map(|b| b.duration_secs())
+            .unwrap_or(0.0)
+            .max(1e-6);
+        let t = t.clamp(0.0, dur);
+        let vis = dur / self.zoom.max(0.001);
+        self.scroll = (t - vis * 0.5).clamp(0.0, (dur - vis).max(0.0));
+        self.playhead_secs = t;
+        self.selected_zone = Some(self.zones.zone_at(t));
+        self.selected_split = None;
+        if let (Some(p), Some(buf)) = (&self.player, &self.input) {
+            p.seek((t * buf.sample_rate as f32) as u64);
+        }
+        self.canvas_cache.clear();
+        self.overlay_cache.clear();
+        // Playhead moved = probe moved.
+        self.refresh_spectrum_line();
+        self.refresh_stereo_meters();
+    }
+
+    /// Jump to the next/previous correlation dip in the timeline.
+    ///
+    /// "Dip" = a local minimum below `DIP_THRESHOLD` that is separated from
+    /// the previous one — otherwise a single wide problem region would
+    /// register as dozens of adjacent hits and stepping through it would
+    /// crawl. Uses the same data the strip draws, so what you see is what
+    /// you step through.
+    fn jump_to_dip(&mut self, forward: bool) {
+        const DIP_THRESHOLD: f32 = 0.5;
+        /// Minimum gap between two reported dips.
+        const MIN_GAP_SECS: f32 = 2.0;
+
+        let Some(tl) = self.corr_timeline.clone() else {
+            self.status = "No correlation data yet — switch to Phase view.".into();
+            return;
+        };
+        if tl.points.is_empty() || tl.hop_secs <= 0.0 {
+            return;
+        }
+
+        // Collect dip centers: runs of consecutive below-threshold points
+        // collapse to the single worst point in the run.
+        let mut dips: Vec<f32> = Vec::new();
+        let mut run_start: Option<usize> = None;
+        let mut run_best = (0usize, f32::MAX);
+        for (i, &(c, w)) in tl.points.iter().enumerate() {
+            let bad = w > 0.05 && c < DIP_THRESHOLD;
+            if bad {
+                if run_start.is_none() {
+                    run_start = Some(i);
+                    run_best = (i, c);
+                } else if c < run_best.1 {
+                    run_best = (i, c);
+                }
+            } else if run_start.take().is_some() {
+                dips.push(run_best.0 as f32 * tl.hop_secs);
+                run_best = (0, f32::MAX);
+            }
+        }
+        if run_start.is_some() {
+            dips.push(run_best.0 as f32 * tl.hop_secs);
+        }
+        // Merge any that ended up closer than MIN_GAP_SECS.
+        dips.dedup_by(|a, b| (*a - *b).abs() < MIN_GAP_SECS);
+
+        if dips.is_empty() {
+            self.status = "No correlation dips found.".into();
+            return;
+        }
+
+        let here = self.playhead_secs;
+        let target = if forward {
+            dips.iter().copied().find(|&t| t > here + 0.05)
+        } else {
+            dips.iter().rev().copied().find(|&t| t < here - 0.05)
+        };
+        match target {
+            Some(t) => {
+                self.navigate_to(t);
+                self.status = format!("Correlation dip at {:.2}s", t);
+            }
+            None => {
+                self.status = if forward {
+                    "No further dips.".into()
+                } else {
+                    "No earlier dips.".into()
+                };
+            }
+        }
+    }
+
     fn zoom_around_playhead(&mut self, factor: f32) {
         let dur = self.input.as_ref().map(|b| b.duration_secs()).unwrap_or(1.0);
         let new_zoom = (self.zoom * factor).clamp(1.0, 1_000_000.0);
@@ -2643,6 +3100,166 @@ impl App {
     /// Edits the INPUT buffer (all channels) so the repair persists through
     /// re-rendering, and records it as an undoable Apply-style frame that
     /// does NOT disturb zone/normalize state (prev == post for those).
+    /// Move the playhead to the detected click at `idx` and mark it current.
+    /// Scan the whole input for clicks at the given `sensitivity` (0..1) and
+    /// return one frame index per detected artifact. Higher sensitivity =
+    /// lower curvature threshold = more (and more subtle) detections; lower =
+    /// only the most obvious outliers. Detection only — never edits audio.
+    fn scan_clicks(&self, sensitivity: f32) -> Vec<usize> {
+        let Some(input) = self.input.as_ref() else {
+            return Vec::new();
+        };
+        let ch = input.channels.max(1) as usize;
+        let frames = input.samples.len() / ch;
+        if frames < 8 {
+            return Vec::new();
+        }
+        // Mono view for detection.
+        let mono: Vec<f32> = if ch == 1 {
+            (*input.samples).clone()
+        } else {
+            (0..frames)
+                .map(|f| {
+                    let mut s = 0.0;
+                    for c in 0..ch {
+                        s += input.samples[f * ch + c];
+                    }
+                    s / ch as f32
+                })
+                .collect()
+        };
+        // NARROWNESS detector. A true click is a NEEDLE: a sample far from
+        // the line through its immediate neighbors, WHERE those neighbors are
+        // themselves smooth. A drum/808 transient is a HILL — sharp but its
+        // neighbors are also moving, so it scores low. This is what separates
+        // clicks from spiky music (pure curvature can't — on dense material
+        // clicks and transients have similar curvature).
+        //
+        // `sensitivity` here is really STRICTNESS: higher = stricter = fewer
+        // detections (conservative, stays quiet on dense material); lower =
+        // looser = more detections. Defaults conservative because dense/
+        // distorted material is inherently spiky and easy to over-flag.
+        //
+        // NOTE (honest limitation): reliable on clean/sparse material; on
+        // dense distorted mixes it can still miss real clicks or need a high
+        // strictness to stay quiet. It's a helper, not a guarantee.
+        let strictness = sensitivity.clamp(0.0, 1.0);
+        // The slider spans the full tradeoff:
+        //   LOOSE end (0): low score bar, excursion gate OFF -> catches even
+        //     small clicks (smaller than the signal), but floods dense
+        //     material. Good for clean/sparse audio where you want everything.
+        //   STRICT end (1): high score bar + full excursion gate -> quiet on
+        //     dense/distorted 808 material (1-2 false positives), catches only
+        //     obvious clicks.
+        // So the user picks the tradeoff to match the material.
+        let k = 6.0 + strictness * 34.0; // score threshold 6..40
+        let exc_gate = strictness * 2.5; // excursion gate 0 (off) .. 2.5
+        let resid_floor = 0.001f32; // ignore sub-milli wiggles (silence noise)
+        let win = 4001usize.min(frames | 1);
+        let half = win / 2;
+        let mut psq = vec![0.0f64; frames + 1];
+        for i in 0..frames {
+            psq[i + 1] = psq[i] + (mono[i] as f64) * (mono[i] as f64);
+        }
+        let local_rms = |i: usize| -> f32 {
+            let lo = i.saturating_sub(half);
+            let hi = (i + half + 1).min(frames);
+            let cnt = (hi - lo).max(1) as f64;
+            (((psq[hi] - psq[lo]) / cnt).sqrt() as f32).max(1e-6)
+        };
+        // A sample passes if it's a strong narrowness "needle" (score), is a
+        // real excursion (floor), and — only when the gate is active — sticks
+        // out above the local level.
+        let passes = |resid: f32, score: f32, excursion: f32| -> bool {
+            score > k && resid > resid_floor && (exc_gate <= 0.0 || excursion > exc_gate)
+        };
+
+        const CLUSTER: usize = 128;
+        let mut clicks: Vec<usize> = Vec::new();
+        let mut i = 2;
+        while i + 2 < frames {
+            let im2 = mono[i - 2];
+            let im1 = mono[i - 1];
+            let ip1 = mono[i + 1];
+            let ip2 = mono[i + 2];
+            let center = mono[i];
+            let pred = (im1 + ip1) * 0.5;
+            let resid = (center - pred).abs();
+            let neigh_rough =
+                (im2 - 2.0 * im1 + ip1).abs() + (im1 - 2.0 * ip1 + ip2).abs();
+            let score = resid / (neigh_rough + 1e-6);
+            let excursion = resid / local_rms(i);
+            if passes(resid, score, excursion) {
+                let mut peak_i = i;
+                let mut peak_r = resid;
+                let mut last = i;
+                let mut j = i + 1;
+                while j + 2 < frames && j - last <= CLUSTER {
+                    let c = mono[j];
+                    let p = (mono[j - 1] + mono[j + 1]) * 0.5;
+                    let r = (c - p).abs();
+                    let nr = (mono[j - 2] - 2.0 * mono[j - 1] + mono[j + 1]).abs()
+                        + (mono[j - 1] - 2.0 * mono[j + 1] + mono[j + 2]).abs();
+                    let sc = r / (nr + 1e-6);
+                    let ex = r / local_rms(j);
+                    if passes(r, sc, ex) {
+                        last = j;
+                        if r > peak_r {
+                            peak_r = r;
+                            peak_i = j;
+                        }
+                    }
+                    j += 1;
+                }
+                clicks.push(peak_i);
+                i = last + 1;
+            } else {
+                i += 1;
+            }
+        }
+        clicks
+    }
+
+    /// Shared post-mode-change logic for the analysis panel: clear caches and
+    /// kick off any computation the newly-selected mode needs.
+    fn on_spectrum_mode_changed(&mut self) -> Task<Msg> {
+        self.canvas_cache.clear();
+        self.meter_cache.clear();
+        if self.spectrum_mode == SpectrumMode::Spectrum {
+            self.refresh_spectrum_line();
+        }
+        self.refresh_stereo_meters();
+        if self.spectrum_mode == SpectrumMode::Phase && self.corr_timeline.is_none() {
+            return self.spawn_corr_timeline();
+        }
+        if self.spectrum_mode == SpectrumMode::Spectrogram {
+            let mut tasks = Vec::new();
+            if self.spectrogram_in.is_none() {
+                tasks.push(self.spawn_spectrogram_in());
+            }
+            if self.spectrogram_out.is_none() {
+                tasks.push(self.spawn_spectrogram_out());
+            }
+            if !tasks.is_empty() {
+                return Task::batch(tasks);
+            }
+        }
+        Task::none()
+    }
+
+    /// Move the playhead to the detected click at `idx` and mark it current.
+    fn jump_to_click(&mut self, idx: usize) {
+        if let Some(&frame) = self.detected_clicks.get(idx) {
+            self.current_click = Some(idx);
+            if let Some(input) = &self.input {
+                let secs = frame as f32 / input.sample_rate.max(1) as f32;
+                self.playhead_secs = secs;
+                self.refresh_spectrum_line();
+                self.canvas_cache.clear();
+            }
+        }
+    }
+
     fn repair_click_at(&mut self, center: usize, _half_span: usize) -> Task<Msg> {
         let Some(input) = self.input.clone() else {
             return Task::none();
@@ -3051,6 +3668,99 @@ impl App {
         self.meter_cache.clear();
     }
 
+    /// Compute the stereo correlation + goniometer points over a window at the
+    /// probe point, for the Correlation / Goniometer analysis modes. Reads the
+    /// INPUT buffer's actual L/R (the clipper is stereo-safe, so in≈out image;
+    /// input is what the user wants to vet). Mono files -> correlation +1,
+    /// no goniometer spread.
+    fn refresh_stereo_meters(&mut self) {
+        if !matches!(self.spectrum_mode, SpectrumMode::Phase) {
+            return;
+        }
+        let Some(buf) = self.input.as_ref() else {
+            self.probe_correlation = None;
+            self.probe_gonio.clear();
+            self.probe_band_corr.clear();
+            return;
+        };
+        let ch = buf.channels.max(1) as usize;
+        let sr = buf.sample_rate;
+        let frames = buf.samples.len() / ch;
+        if frames == 0 {
+            return;
+        }
+        let probe = ((self.playhead_secs * sr as f32) as usize).min(frames.saturating_sub(1));
+        // Window: ~100 ms around the probe (long enough to be a stable reading
+        // of the section, short enough to be "this moment").
+        let win = ((sr as usize) / 10).max(256);
+        let lo = probe.saturating_sub(win / 2);
+        let hi = (lo + win).min(frames);
+
+        if ch < 2 {
+            // Mono: perfectly correlated, no stereo spread.
+            self.probe_correlation = Some(1.0);
+            self.probe_gonio.clear();
+            self.probe_band_corr.clear();
+            self.meter_cache.clear();
+            return;
+        }
+
+        // Pearson correlation of L and R over the window.
+        let mut sum_l = 0.0f64;
+        let mut sum_r = 0.0f64;
+        let mut sum_ll = 0.0f64;
+        let mut sum_rr = 0.0f64;
+        let mut sum_lr = 0.0f64;
+        let n = (hi - lo).max(1) as f64;
+        for f in lo..hi {
+            let l = buf.samples[f * ch] as f64;
+            let r = buf.samples[f * ch + 1] as f64;
+            sum_l += l;
+            sum_r += r;
+            sum_ll += l * l;
+            sum_rr += r * r;
+            sum_lr += l * r;
+        }
+        let cov = sum_lr - sum_l * sum_r / n;
+        let var_l = sum_ll - sum_l * sum_l / n;
+        let var_r = sum_rr - sum_r * sum_r / n;
+        let denom = (var_l * var_r).sqrt();
+        let corr = if denom > 1e-12 {
+            (cov / denom).clamp(-1.0, 1.0) as f32
+        } else {
+            1.0 // silence / identical -> treat as fully correlated
+        };
+        self.probe_correlation = Some(corr);
+
+        // Goniometer points: downsample the window to ~600 points (L,R) pairs.
+        let target = 600usize;
+        let stepd = ((hi - lo) / target).max(1);
+        self.probe_gonio.clear();
+        let mut f = lo;
+        while f < hi {
+            let l = buf.samples[f * ch];
+            let r = buf.samples[f * ch + 1];
+            self.probe_gonio.push((l, r));
+            f += stepd;
+        }
+
+        // Per-frequency correlation. The broadband number above is
+        // loudness-weighted, so it's dominated by whatever's loudest —
+        // usually near-mono kick and sub. A band sitting at -0.4 in the low
+        // mids can hide behind a healthy-looking +0.8 overall, and that band
+        // is exactly what vanishes on a mono club sub. This curve answers
+        // *where*, which is the question you can act on.
+        //
+        // Reads the INPUT buffer (like the goniometer): the clipper is
+        // memoryless and applies the identical curve to both channels, so
+        // this is a property of the source material, and the meter is here
+        // to verify the tool isn't the one causing phase trouble.
+        self.probe_band_corr =
+            fft::band_correlation(&buf.samples, ch, probe).unwrap_or_default();
+
+        self.meter_cache.clear();
+    }
+
     /// Invalidate the cached spectrum lines (call when audio changes — load,
     /// DSP done, Apply, undo/redo — so the next refresh recomputes).
     fn invalidate_spectrum_line(&mut self) {
@@ -3067,20 +3777,19 @@ impl App {
         }
         let mono = self.mono_input.clone();
         let sr = self.input.as_ref().map(|b| b.sample_rate).unwrap_or(44100);
+        let fft_size = self.settings.spectrogram_fft_size;
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || Arc::new(fft::compute_spectrogram(&mono, sr)))
+                tokio::task::spawn_blocking(move || {
+                    Arc::new(fft::compute_spectrogram(&mono, sr, fft_size))
+                })
                     .await
                     .ok()
             },
             |maybe_sg| {
-                Msg::SpectrogramInDone(maybe_sg.unwrap_or_else(|| {
-                    Arc::new(fft::Spectrogram {
-                        slices: Vec::new(),
-                        hop: 1024,
-                        sample_rate: 44100,
-                    })
-                }))
+                Msg::SpectrogramInDone(
+                    maybe_sg.unwrap_or_else(|| Arc::new(fft::Spectrogram::empty(44100))),
+                )
             },
         )
     }
@@ -3091,23 +3800,57 @@ impl App {
         }
         let mono = self.mono_output.clone();
         let sr = self.input.as_ref().map(|b| b.sample_rate).unwrap_or(44100);
+        let fft_size = self.settings.spectrogram_fft_size;
         Task::perform(
             async move {
-                tokio::task::spawn_blocking(move || Arc::new(fft::compute_spectrogram(&mono, sr)))
+                tokio::task::spawn_blocking(move || {
+                    Arc::new(fft::compute_spectrogram(&mono, sr, fft_size))
+                })
                     .await
                     .ok()
             },
             |maybe_sg| {
-                Msg::SpectrogramOutDone(maybe_sg.unwrap_or_else(|| {
-                    Arc::new(fft::Spectrogram {
-                        slices: Vec::new(),
-                        hop: 1024,
-                        sample_rate: 44100,
+                Msg::SpectrogramOutDone(
+                    maybe_sg.unwrap_or_else(|| Arc::new(fft::Spectrogram::empty(44100))),
+                )
+            },
+        )
+    }
+    /// Compute the whole-file correlation timeline in the background.
+    ///
+    /// Reads the PROCESSED buffer. Clipping is memoryless, but it's applied
+    /// per-channel — when L and R differ in level the louder one is shaped
+    /// harder, and the harmonics generated in each channel aren't identical.
+    /// That's a real (usually small) correlation shift, concentrated exactly
+    /// where the clipping is heaviest, so the strip should show what you're
+    /// actually going to export rather than what you started with.
+    fn spawn_corr_timeline(&self) -> Task<Msg> {
+        let Some(out) = self.processed.as_ref() else {
+            return Task::none();
+        };
+        // `samples` is an Arc — this clone is a refcount bump, not a copy.
+        let samples = out.samples.clone();
+        let ch = out.channels.max(1) as usize;
+        let sr = out.sample_rate;
+        Task::perform(
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    Arc::new(fft::correlation_timeline(&samples, ch, sr))
+                })
+                .await
+                .ok()
+            },
+            |maybe| {
+                Msg::CorrTimelineDone(maybe.unwrap_or_else(|| {
+                    Arc::new(fft::CorrTimeline {
+                        points: Vec::new(),
+                        hop_secs: 0.0,
                     })
                 }))
             },
         )
     }
+
     /// 15 ms is roughly one period of 67 Hz, so we always find a crossing
     /// even on bass-heavy material; small enough that the snap stays close
     /// to where the user intended.
@@ -3159,9 +3902,9 @@ impl App {
 
         let top_bar = row![
             file_menu_btn,
-            // Pulled-out menu items. Toggle icons light up when their
-            // setting is enabled (snap, reduction overlay, guide line).
-            // Settings is a non-toggle — just opens the modal.
+            // Zero-crossing snap: an EDITING behavior (it changes where
+            // splits land), so it stays in the toolbar rather than moving
+            // into the View menu — that menu is display-only.
             toggle_icon_button(
                 ICON_ZERO_CROSSING,
                 Msg::ToggleSnap,
@@ -3169,27 +3912,17 @@ impl App {
                 accent,
                 accent_hover,
             ),
+            // "View" dropdown (eyeball). Everything that changes what you
+            // SEE lives in here — the analysis-panel mode (radio) and the
+            // overlay toggles (checkboxes) — leaving the toolbar for
+            // transport, zoom and things that actually touch the audio.
+            // Lit whenever anything view-ish is active.
             toggle_icon_button(
-                ICON_REDUCTION,
-                Msg::ToggleReduction,
-                self.show_reduction,
-                accent,
-                accent_hover,
-            ),
-            toggle_icon_button(
-                ICON_GUIDES,
-                Msg::ToggleGuide,
-                self.guide_db.is_some(),
-                accent,
-                accent_hover,
-            ),
-            // FFT/spectrogram view cycle. Lit whenever a spectrum view is
-            // active (Spectrum or Spectrogram); click cycles through the
-            // three modes (Off → Spectrum → Spectrogram → Off).
-            toggle_icon_button(
-                ICON_FFT_VIEW,
-                Msg::CycleSpectrumMode,
-                self.spectrum_mode != SpectrumMode::Off,
+                ICON_EYE,
+                Msg::ToggleViewMenu,
+                self.spectrum_mode != SpectrumMode::Off
+                    || self.guide_db.is_some()
+                    || self.show_reduction,
                 accent,
                 accent_hover,
             ),
@@ -3432,9 +4165,10 @@ impl App {
 
         let canvas_widget: Element<'_, Msg> = if let Some(buf) = &self.input {
             let fft_mode = match self.spectrum_mode {
-                SpectrumMode::Off => 0,
+                SpectrumMode::Off => 0u8,
                 SpectrumMode::Spectrum => 1,
                 SpectrumMode::Spectrogram => 2,
+                SpectrumMode::Phase => 3,
             };
             let (env_in_color, env_out_color) = self.settings.waveform_scheme.colors(
                 self.settings.accent.color(),
@@ -3462,6 +4196,13 @@ impl App {
                 meter_out: self.meter_out,
                 fft_mode,
                 click_repair_mode: self.click_repair_mode,
+                detected_clicks: &self.detected_clicks,
+                current_click: self.current_click,
+                probe_correlation: self.probe_correlation,
+                probe_band_corr: &self.probe_band_corr,
+                mono_fold: self.mono_fold,
+                corr_timeline: self.corr_timeline.as_deref(),
+                probe_gonio: &self.probe_gonio,
                 spectrogram_in: self.spectrogram_in.as_deref(),
                 spectrogram_out: self.spectrogram_out.as_deref(),
                 spectrum_line_out: self.spectrum_line_out.as_deref().map(|v| v.as_slice()),
@@ -3541,6 +4282,25 @@ impl App {
             .height(Length::Fill);
 
             stack![base, dismiss_layer, menu_overlay].into()
+        } else if self.view_menu_open {
+            // Same pattern as the file menu, anchored under the eyeball
+            // button instead of the burger. VIEW_MENU_LEFT is the eyeball's
+            // x-offset in the toolbar — see the const for the arithmetic.
+            let dismiss_layer = mouse_area(
+                container(Space::with_width(Length::Fill))
+                    .width(Length::Fill)
+                    .height(Length::Fill),
+            )
+            .on_press(Msg::CloseViewMenu);
+
+            let menu_overlay = container(
+                row![self.build_view_menu(), Space::with_width(Length::Fill)]
+                    .padding(iced::padding::top(44).left(VIEW_MENU_LEFT).right(8)),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+            stack![base, dismiss_layer, menu_overlay].into()
         } else if let Some((zi, split_idx, x, y)) = self.zone_ctx_menu {
             // Floating context menu for a right-clicked zone. Layered:
             //   base UI → invisible dismiss layer → the menu itself.
@@ -3583,6 +4343,23 @@ impl App {
             let modal = self.build_auto_detect_modal(ad);
             let centered = container(modal).center_x(Length::Fill).center_y(Length::Fill);
             stack![base, dismiss_layer, centered].into()
+        } else if let Some(path) = &self.export_confirm {
+            // Post-export confirmation modal.
+            let dismiss_layer = mouse_area(
+                container(Space::with_width(Length::Fill))
+                    .width(Length::Fill)
+                    .height(Length::Fill)
+                    .style(|_t: &Theme| container::Style {
+                        background: Some(iced::Background::Color(Color::from_rgba(
+                            0.0, 0.0, 0.0, 0.55,
+                        ))),
+                        ..Default::default()
+                    }),
+            )
+            .on_press(Msg::CloseExportConfirm);
+            let modal = self.build_export_confirm_modal(path);
+            let centered = container(modal).center_x(Length::Fill).center_y(Length::Fill);
+            stack![base, dismiss_layer, centered].into()
         } else if let Some(draft) = &self.settings_draft {
             // Settings modal — same dim-backdrop pattern.
             let dismiss_layer = mouse_area(
@@ -3604,6 +4381,196 @@ impl App {
         } else {
             base.into()
         }
+    }
+
+    /// Build the "View" dropdown (the eyeball button's menu).
+    ///
+    /// Two kinds of item, deliberately distinguished by their marker shape:
+    ///
+    ///   • **Radio (circle)** — the analysis-panel mode. Mutually exclusive:
+    ///     Off / Spectrum / Spectrogram / Phase, one active at a time.
+    ///   • **Checkbox (square)** — overlays. Independent on/off, and they
+    ///     stack over whichever panel mode is selected.
+    ///
+    /// Every row shows its keyboard shortcut, so the menu doubles as a
+    /// cheat-sheet — the shortcuts stay live whether or not the menu is open.
+    ///
+    /// The markers are drawn as tiny styled containers rather than unicode
+    /// glyphs (●/☑) so they render identically regardless of what the font
+    /// happens to have.
+    ///
+    /// Returns `'static` because every piece of content is owned — nothing
+    /// borrows from `self` past construction.
+    fn build_view_menu(&self) -> Element<'static, Msg> {
+        use crate::keybindings::KeyAction;
+
+        let accent = self.settings.accent.color();
+        let dim = Color::from_rgba(1.0, 1.0, 1.0, 0.42);
+
+        // Row background: transparent at rest, accent-tinted on hover —
+        // same visual language as the file menu.
+        let row_style = move |_theme: &Theme, status: button::Status| {
+            let bg = match status {
+                button::Status::Hovered | button::Status::Pressed => {
+                    Some(iced::Background::Color(Color { a: 0.22, ..accent }))
+                }
+                _ => None,
+            };
+            button::Style {
+                background: bg,
+                text_color: Color::WHITE,
+                border: iced::Border {
+                    radius: 2.0.into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        };
+
+        // `circular` picks the marker shape: circle = radio (pick one),
+        // rounded square = checkbox (independent toggle).
+        let marker = move |on: bool, circular: bool| -> Element<'static, Msg> {
+            const SIZE: f32 = 11.0;
+            let radius = if circular { SIZE / 2.0 } else { 2.5 };
+            container(Space::with_width(0))
+                .width(Length::Fixed(SIZE))
+                .height(Length::Fixed(SIZE))
+                .style(move |_t: &Theme| container::Style {
+                    background: Some(iced::Background::Color(if on {
+                        accent
+                    } else {
+                        Color::TRANSPARENT
+                    })),
+                    border: iced::Border {
+                        color: if on {
+                            accent
+                        } else {
+                            Color::from_rgba(1.0, 1.0, 1.0, 0.30)
+                        },
+                        width: 1.0,
+                        radius: radius.into(),
+                    },
+                    ..Default::default()
+                })
+                .into()
+        };
+
+        let item = move |on: bool,
+                         circular: bool,
+                         label: String,
+                         shortcut: String,
+                         msg: Msg|
+              -> Element<'static, Msg> {
+            button(
+                row![
+                    marker(on, circular),
+                    Space::with_width(10),
+                    text(label).size(13),
+                    Space::with_width(Length::Fill),
+                    text(shortcut).size(11).color(dim),
+                ]
+                .align_y(iced::Alignment::Center),
+            )
+            .on_press(msg)
+            .padding([5, 12])
+            .width(Length::Fill)
+            .style(row_style)
+            .into()
+        };
+
+        // Small dim section caption, with an optional right-aligned hint.
+        let caption = move |label: &'static str, hint: String| -> Element<'static, Msg> {
+            row![
+                text(label).size(10).color(dim),
+                Space::with_width(Length::Fill),
+                text(hint).size(10).color(dim),
+            ]
+            .padding([5, 12])
+            .into()
+        };
+
+        let kb = &self.settings.keybindings;
+        let mut items: Vec<Element<'static, Msg>> = Vec::new();
+
+        items.push(caption(
+            "ANALYSIS PANEL",
+            format!("{} cycles", kb.display(KeyAction::CycleFft)),
+        ));
+        for &mode in SpectrumMode::ALL.iter() {
+            items.push(item(
+                self.spectrum_mode == mode,
+                true,
+                mode.menu_label().to_string(),
+                String::new(),
+                Msg::SetSpectrumMode(mode),
+            ));
+        }
+
+        items.push(horizontal_rule(1).into());
+
+        items.push(caption("OVERLAYS", String::new()));
+        items.push(item(
+            self.guide_db.is_some(),
+            false,
+            "Guideline".to_string(),
+            kb.display(KeyAction::ToggleGuideLine),
+            Msg::ToggleGuide,
+        ));
+        items.push(item(
+            self.show_reduction,
+            false,
+            "Clipping".to_string(),
+            kb.display(KeyAction::ToggleReduction),
+            Msg::ToggleReduction,
+        ));
+
+        // Spectrogram window size. Only shown when the spectrogram is the
+        // active panel — it's meaningless otherwise, and the menu is
+        // already the longest thing in the UI.
+        if self.spectrum_mode == SpectrumMode::Spectrogram {
+            items.push(horizontal_rule(1).into());
+            items.push(caption("WINDOW SIZE", "time / freq".to_string()));
+            let sr = self
+                .input
+                .as_ref()
+                .map(|b| b.sample_rate)
+                .unwrap_or(48000);
+            for n in fft::FFT_SIZES {
+                items.push(item(
+                    self.settings.spectrogram_fft_size == n,
+                    true,
+                    fft::fft_size_label(n, sr),
+                    String::new(),
+                    Msg::SetSpectrogramFftSize(n),
+                ));
+            }
+        }
+
+        let menu = column(items).spacing(0).width(VIEW_MENU_WIDTH);
+
+        // Menu items do NOT close the menu — flipping between panel modes
+        // and stacking overlays is a "try it and look" activity, so the
+        // menu stays put while the waveform updates behind it. It closes on
+        // an outside click, on the eyeball, or 300 ms after the mouse leaves.
+        mouse_area(
+            container(menu)
+                .padding(2)
+                .style(|_theme: &Theme| container::Style {
+                    background: Some(iced::Background::Color(Color::from_rgb(
+                        0.1255, 0.1333, 0.1451,
+                    ))),
+                    text_color: Some(Color::WHITE),
+                    border: iced::Border {
+                        color: Color::from_rgba(1.0, 1.0, 1.0, 0.25),
+                        width: 1.0,
+                        radius: 4.0.into(),
+                    },
+                    ..Default::default()
+                }),
+        )
+        .on_enter(Msg::ViewMenuMouseEnter)
+        .on_exit(Msg::ViewMenuMouseExit)
+        .into()
     }
 
     /// Build the auto-detect-zones modal panel.
@@ -3639,7 +4606,7 @@ impl App {
 
         let sens_row: Element<'_, Msg> = row![
             text("Sensitivity").width(110),
-            slider(0.0..=1.0, ad.sensitivity, Msg::SetDetectSensitivity).step(0.05),
+            slider(0.0..=1.0, ad.sensitivity, Msg::SetDetectSensitivity).step(0.05_f32),
             text(format!("{:.0}%", ad.sensitivity * 100.0)).width(50),
         ]
         .spacing(8)
@@ -3705,6 +4672,102 @@ impl App {
 
     /// Build the Settings modal. Reads from `draft` so the user can
     /// flip controls without committing until they hit Save.
+    /// Post-export confirmation modal: confirms the save, shows where the
+    /// file went, and offers the send-to-external-tool buttons.
+    fn build_export_confirm_modal(&self, path: &std::path::Path) -> Element<'_, Msg> {
+        let accent = self.settings.accent.color();
+        let accent_h = self.settings.accent.color_hover();
+
+        let filename = path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default();
+        let folder = path
+            .parent()
+            .map(|d| d.to_string_lossy().to_string())
+            .unwrap_or_default();
+
+        // Send-to tool buttons (if any configured).
+        let tools_section: Element<'_, Msg> = if self.settings.external_tools.is_empty() {
+            text("Add external tools in Settings to send exported files to them.")
+                .size(12)
+                .color(Color::from_rgba(1.0, 1.0, 1.0, 0.45))
+                .into()
+        } else {
+            let mut btns = row![].spacing(8).align_y(iced::Alignment::Center);
+            for (i, tool) in self.settings.external_tools.iter().enumerate() {
+                let acc = accent;
+                let acc_h = accent_h;
+                let b = button(text(tool.name.clone()).size(13))
+                    .on_press(Msg::SendToTool(i))
+                    .padding([6, 14])
+                    .style(move |_th: &Theme, status: button::Status| {
+                        let bg = match status {
+                            button::Status::Hovered | button::Status::Pressed => acc_h,
+                            _ => acc,
+                        };
+                        button::Style {
+                            background: Some(iced::Background::Color(bg)),
+                            text_color: Color::WHITE,
+                            border: iced::Border {
+                                radius: 3.0.into(),
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        }
+                    });
+                btns = btns.push(b);
+            }
+            column![
+                text("Send to:")
+                    .size(12)
+                    .color(Color::from_rgba(1.0, 1.0, 1.0, 0.7)),
+                btns,
+            ]
+            .spacing(6)
+            .into()
+        };
+
+        let done = button(text("Done").size(13))
+            .on_press(Msg::CloseExportConfirm)
+            .padding([6, 16]);
+
+        let inner = column![
+            text("Export complete").size(18),
+            Space::with_height(4),
+            row![
+                text("File:").size(12).width(60).color(Color::from_rgba(1.0, 1.0, 1.0, 0.6)),
+                text(filename).size(13).color(Color::from_rgba(1.0, 1.0, 1.0, 0.95)),
+            ]
+            .spacing(8),
+            row![
+                text("Folder:").size(12).width(60).color(Color::from_rgba(1.0, 1.0, 1.0, 0.6)),
+                text(folder).size(12).color(Color::from_rgba(1.0, 1.0, 1.0, 0.75)),
+            ]
+            .spacing(8),
+            Space::with_height(10),
+            tools_section,
+            Space::with_height(12),
+            row![Space::with_width(Length::Fill), done],
+        ]
+        .spacing(6)
+        .width(560);
+
+        container(inner)
+            .padding(20)
+            .style(|_t: &Theme| container::Style {
+                background: Some(iced::Background::Color(Color::from_rgb(0.10, 0.11, 0.13))),
+                text_color: Some(Color::WHITE),
+                border: iced::Border {
+                    radius: 6.0.into(),
+                    width: 1.0,
+                    color: Color::from_rgba(1.0, 1.0, 1.0, 0.15),
+                },
+                ..Default::default()
+            })
+            .into()
+    }
+
     fn build_settings_modal(&self, draft: &settings::Settings) -> Element<'_, Msg> {
         // Row of theme buttons; current selection is highlighted with the
         // accent color.
@@ -3837,8 +4900,42 @@ impl App {
         .spacing(8)
         .align_y(iced::Alignment::Center);
 
-        // Read-only display of current keybindings. Editable only by hand
-        // in `~/.config/peakmuncher/settings.json` for now.
+        // External-tools editor: a list of name + command rows (each with a
+        // Remove button), plus an "Add tool" button. `%f` in a command is
+        // replaced with the exported file's path at send time.
+        let mut tool_rows: Vec<Element<'_, Msg>> = Vec::new();
+        tool_rows.push(
+            text("Send-to tools  (use %f for the file path)")
+                .size(12)
+                .color(Color::from_rgba(1.0, 1.0, 1.0, 0.6))
+                .into(),
+        );
+        for (i, tool) in draft.external_tools.iter().enumerate() {
+            let row_el: Element<'_, Msg> = row![
+                text_input("Name", &tool.name)
+                    .on_input(move |s| Msg::DraftSetToolName(i, s))
+                    .size(13)
+                    .width(140),
+                text_input("program %f", &tool.command)
+                    .on_input(move |s| Msg::DraftSetToolCommand(i, s))
+                    .size(13)
+                    .width(Length::Fill),
+                button(text("✕").size(13))
+                    .on_press(Msg::DraftRemoveTool(i))
+                    .padding([4, 10]),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center)
+            .into();
+            tool_rows.push(row_el);
+        }
+        tool_rows.push(
+            button(text("+ Add tool").size(13))
+                .on_press(Msg::DraftAddTool)
+                .padding([4, 12])
+                .into(),
+        );
+        let tools_block: Element<'_, Msg> = column(tool_rows).spacing(6).into();
         let mut kb_rows: Vec<Element<'_, Msg>> = Vec::new();
         kb_rows.push(
             text("Keyboard shortcuts (edit settings.json to change)")
@@ -3899,6 +4996,8 @@ impl App {
             scheme_row,
             open_row,
             export_row,
+            Space::with_height(8),
+            tools_block,
             Space::with_height(8),
             kb_block,
             Space::with_height(12),
@@ -4173,7 +5272,7 @@ impl App {
             row![
                 text("Ceiling").width(110),
                 slider(-30.0..=0.0, zone.ceiling_db, Msg::SetCeiling)
-                    .step(0.1)
+                    .step(0.1_f32)
                     .on_release(Msg::Commit),
                 text(format!("{:+.1} dB", zone.ceiling_db)).width(80),
             ]
@@ -4192,7 +5291,7 @@ impl App {
         let in_gain = row![
             text("Input gain").width(110),
             slider(-12.0..=24.0, zone.input_gain_db, Msg::SetInputGain)
-                .step(0.1)
+                .step(0.1_f32)
                 .on_release(Msg::Commit),
             text(format!("{:+.1} dB", zone.input_gain_db)).width(80),
         ]
@@ -4280,6 +5379,65 @@ impl App {
         ]
         .spacing(8)
         .align_y(iced::Alignment::Center);
+
+        // Click detection scan. Detection only — marks clicks on the waveform
+        // (including ones too subtle to see); the user heals them manually
+        // with Click Repair. When clicks are found, prev/next chevrons step
+        // the cursor through them (like the zone nav).
+        let mut scan_row = row![
+            text("Scan").width(110),
+            button(text("Scan for clicks").size(13))
+                .on_press(Msg::ScanForClicks)
+                .padding([4, 10]),
+        ]
+        .spacing(8)
+        .align_y(iced::Alignment::Center);
+        if self.detected_clicks.is_empty() {
+            scan_row = scan_row.push(
+                text("finds clicks and marks them (heal them manually)")
+                    .size(11)
+                    .color(Color::from_rgba(1.0, 1.0, 1.0, 0.45)),
+            );
+        } else {
+            let n = self.detected_clicks.len();
+            let cur = self.current_click.unwrap_or(0);
+            let acc_hover = self.settings.accent.color_hover();
+            let prev_c = icon_button_opt(
+                ICON_CHEVRON_LEFT,
+                if cur > 0 { Some(Msg::PrevClick) } else { None },
+                acc_hover,
+            );
+            let next_c = icon_button_opt(
+                ICON_CHEVRON_RIGHT,
+                if cur + 1 < n { Some(Msg::NextClick) } else { None },
+                acc_hover,
+            );
+            scan_row = scan_row
+                .push(prev_c)
+                .push(next_c)
+                .push(text(format!("Click {} of {}", cur + 1, n)).size(12))
+                .push(
+                    button(text("Clear").size(13))
+                        .on_press(Msg::ClearClickMarkers)
+                        .padding([4, 10]),
+                );
+        }
+        // Sensitivity slider — shown once a scan has been run. Re-scans live
+        // as it moves so the marker count tracks the setting; dial it down to
+        // stop flagging legitimate transients (drum hits, plucks).
+        let scan_block: Element<'_, Msg> = if self.click_scan_active {
+            let sens_row = row![
+                text("Strictness").width(110),
+                slider(0.0..=1.0, self.click_sensitivity, Msg::SetClickSensitivity)
+                    .step(0.01_f32),
+                text(format!("{:.0}%", self.click_sensitivity * 100.0)).width(50),
+            ]
+            .spacing(8)
+            .align_y(iced::Alignment::Center);
+            column![scan_row, sens_row].spacing(6).into()
+        } else {
+            scan_row.into()
+        };
         let current_state = if !self.normalize_enabled {
             NormalizeState::Off
         } else {
@@ -4309,7 +5467,7 @@ impl App {
                 self.normalize_target_db,
                 Msg::SetNormalizeTarget
             )
-            .step(0.1),
+            .step(0.1_f32),
             text(format!(
                 "{:+.1} {}",
                 self.normalize_target_db,
@@ -4344,7 +5502,6 @@ impl App {
         .spacing(8)
         .align_y(iced::Alignment::Center);
 
-        // Active-tab content. Only the selected tab's controls render.
         // (The tab bar in zone_nav is the section header now, so no inline
         // section labels here.)
         let os_row = row![
@@ -4363,7 +5520,7 @@ impl App {
             let knee_row = row![
                 text("Knee").width(110),
                 slider(0.0..=1.0, zone.knee, Msg::SetKnee)
-                    .step(0.01)
+                    .step(0.01_f32)
                     .on_release(Msg::Commit),
                 text(format!("{:.0}%", zone.knee * 100.0)).width(80),
             ]
@@ -4378,7 +5535,7 @@ impl App {
         let tab_content: Element<'_, Msg> = match self.active_tab {
             ControlTab::Clipper => clipper_col,
             ControlTab::Levels => column![in_gain].spacing(6).into(),
-            ControlTab::Fix => column![dc_offset, dc_blocker, click_repair].spacing(6).into(),
+            ControlTab::Fix => column![dc_offset, dc_blocker, click_repair, scan_block].spacing(6).into(),
             ControlTab::Output => column![normalize, fade_in, fade_out]
                 .spacing(6)
                 .into(),

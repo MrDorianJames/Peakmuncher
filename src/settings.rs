@@ -316,6 +316,37 @@ fn parse_hex_color(s: &str) -> Option<HexColor> {
     )))
 }
 
+/// A user-configured external program that an exported file can be handed
+/// off to. `command` is a template: the token `%f` is replaced with the
+/// exported file's full path (as a single argument, so paths with spaces
+/// are safe). The first whitespace-separated token is the executable; the
+/// rest are its arguments.
+///
+/// Examples:
+///   name = "CDJ Prep",  command = "cdj-prep %f"
+///   name = "Queue",      command = "some-tool --input %f --queue"
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExternalTool {
+    pub name: String,
+    pub command: String,
+}
+
+impl ExternalTool {
+    /// Split the command template into (program, args), substituting `%f`
+    /// with `file_path`. The `%f` token is replaced as a WHOLE argument so
+    /// spaces in the path don't split it. Returns None if the template has
+    /// no program token. Naive whitespace tokenization otherwise (no shell
+    /// quoting) — fine for the simple `prog --flag %f` templates intended.
+    pub fn resolve(&self, file_path: &str) -> Option<(String, Vec<String>)> {
+        let mut tokens = self.command.split_whitespace();
+        let program = tokens.next()?.to_string();
+        let args: Vec<String> = tokens
+            .map(|tok| tok.replace("%f", file_path))
+            .collect();
+        Some((program, args))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Settings {
     #[serde(default)]
@@ -334,8 +365,22 @@ pub struct Settings {
     pub default_open_dir: Option<PathBuf>,
     #[serde(default)]
     pub default_export_dir: Option<PathBuf>,
+    /// User-configured external programs an exported file can be sent to
+    /// (e.g. a CDJ-prep batch tool). Empty by default. `%f` in a tool's
+    /// command is replaced with the exported file path.
+    #[serde(default)]
+    pub external_tools: Vec<ExternalTool>,
     #[serde(default)]
     pub keybindings: crate::keybindings::Bindings,
+    /// Spectrogram window size. Longer = better frequency resolution and
+    /// worse time resolution; the product is fixed, so this is a trade to
+    /// suit what you're looking for, not a quality dial.
+    #[serde(default = "default_sg_fft")]
+    pub spectrogram_fft_size: usize,
+}
+
+fn default_sg_fft() -> usize {
+    crate::fft::FFT_SIZE
 }
 
 impl Default for Settings {
@@ -348,7 +393,9 @@ impl Default for Settings {
             custom_output_color: default_custom_out(),
             default_open_dir: None,
             default_export_dir: None,
+            external_tools: Vec::new(),
             keybindings: crate::keybindings::Bindings::default(),
+            spectrogram_fft_size: default_sg_fft(),
         }
     }
 }

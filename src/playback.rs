@@ -32,6 +32,10 @@ pub struct PlaybackState {
     /// We track input and output separately so the meter can show pre/post.
     pub peak_in: AtomicU32,
     pub peak_out: AtomicU32,
+    /// Monitor the L+R mono sum instead of stereo. A MONITORING control
+    /// only — it changes what comes out of the speakers, never the audio
+    /// that gets analyzed, rendered or exported.
+    pub mono_fold: AtomicBool,
 }
 
 impl PlaybackState {
@@ -42,6 +46,7 @@ impl PlaybackState {
             which: Mutex::new(Source::Processed),
             peak_in: AtomicU32::new(0),
             peak_out: AtomicU32::new(0),
+            mono_fold: AtomicBool::new(false),
         }
     }
 }
@@ -156,6 +161,18 @@ impl Player {
         *self.state.which.lock().unwrap()
     }
 
+    /// Toggle mono-fold monitoring. Takes effect on the next audio callback,
+    /// so it's safe to flip mid-playback — which is the point: the useful
+    /// comparison is A/B'ing stereo against mono on the same passage.
+    pub fn set_mono_fold(&self, on: bool) {
+        self.state.mono_fold.store(on, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    pub fn mono_fold(&self) -> bool {
+        self.state.mono_fold.load(Ordering::Relaxed)
+    }
+
     pub fn is_playing(&self) -> bool {
         self.state.playing.load(Ordering::Relaxed)
     }
@@ -217,6 +234,8 @@ fn fill_callback(
     let out_frames = out.len() / out_channels.max(1) as usize;
     let mut pos = state.frame.load(Ordering::Relaxed) as f64;
 
+    let mono = state.mono_fold.load(Ordering::Relaxed);
+
     let mut peak_in_local = 0.0f32;
     let mut peak_out_local = 0.0f32;
 
@@ -233,26 +252,41 @@ fn fill_callback(
         }
         let frac = (pos - i0 as f64) as f32;
 
-        for oc in 0..out_channels as usize {
-            let ic = if in_ch == 1 { 0 } else { oc.min(in_ch - 1) };
-            let s0 = src[i0 * in_ch + ic];
-            let s1 = if i1 < in_frames {
-                src[i1 * in_ch + ic]
-            } else {
-                s0
-            };
-            let s = s0 + (s1 - s0) * frac;
+        // Mono fold, or a stereo file going to a mono device, both need the
+        // same thing: the average of all input channels. Compute it once
+        // per frame rather than once per output channel.
+        //
+        // The average (not the sum) is the correct fold: content that's
+        // already mono keeps its level, and anything out of phase between
+        // the channels cancels — which is exactly what a mono PA does, and
+        // exactly what this toggle exists to let you hear.
+        let downmix_needed = mono || (in_ch > 1 && (out_channels as usize) == 1);
+        let folded = if downmix_needed && in_ch > 1 {
+            let mut acc = 0.0;
+            for c in 0..in_ch {
+                let a = src[i0 * in_ch + c];
+                let b = if i1 < in_frames { src[i1 * in_ch + c] } else { a };
+                acc += a + (b - a) * frac;
+            }
+            acc / in_ch as f32
+        } else {
+            0.0
+        };
 
-            let s_final = if in_ch > 1 && (out_channels as usize) == 1 {
-                let mut acc = 0.0;
-                for c in 0..in_ch {
-                    let a = src[i0 * in_ch + c];
-                    let b = if i1 < in_frames { src[i1 * in_ch + c] } else { a };
-                    acc += a + (b - a) * frac;
-                }
-                acc / in_ch as f32
+        for oc in 0..out_channels as usize {
+            let s_final = if downmix_needed && in_ch > 1 {
+                // Same folded signal to every output channel — mono in the
+                // centre of the image, not collapsed into the left speaker.
+                folded
             } else {
-                s
+                let ic = if in_ch == 1 { 0 } else { oc.min(in_ch - 1) };
+                let s0 = src[i0 * in_ch + ic];
+                let s1 = if i1 < in_frames {
+                    src[i1 * in_ch + ic]
+                } else {
+                    s0
+                };
+                s0 + (s1 - s0) * frac
             };
             out[f * out_channels as usize + oc] = s_final;
         }
