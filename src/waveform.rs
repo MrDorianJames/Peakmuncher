@@ -248,9 +248,9 @@ impl<'a> Waveform<'a> {
         Some((wx, self.overview_y(canvas_h), ww, OVERVIEW_H))
     }
 
-    /// Rect of the Phase panel (the whole FFT area when Phase is active).
-    fn phase_panel_rect(&self, canvas_w: f32, canvas_h: f32) -> Option<(f32, f32, f32, f32)> {
-        if self.fft_mode != 3 {
+    /// Rect of the FFT panel, whatever mode it's in. `None` when hidden.
+    fn fft_panel_rect(&self, canvas_w: f32, canvas_h: f32) -> Option<(f32, f32, f32, f32)> {
+        if self.fft_mode == 0 {
             return None;
         }
         let (wx, _wy, ww, _wh) = self.wave_area(canvas_w, canvas_h);
@@ -260,6 +260,27 @@ impl<'a> Waveform<'a> {
             return None;
         }
         Some((wx, fft_y, ww, fft_h))
+    }
+
+    /// Rect of the Phase panel (the whole FFT area when Phase is active).
+    fn phase_panel_rect(&self, canvas_w: f32, canvas_h: f32) -> Option<(f32, f32, f32, f32)> {
+        if self.fft_mode != 3 {
+            return None;
+        }
+        self.fft_panel_rect(canvas_w, canvas_h)
+    }
+
+    /// Rect of the spectrogram, or `None` when it isn't the active panel.
+    ///
+    /// The spectrogram is the ONLY analysis panel whose x axis is time — the
+    /// spectrum line and the phase curve are both frequency-on-x. So it's
+    /// the only one where waveform gestures (click to seek, drag to scrub,
+    /// wheel to zoom) have a meaning, and the only one that gets a playhead.
+    fn spectrogram_rect(&self, canvas_w: f32, canvas_h: f32) -> Option<(f32, f32, f32, f32)> {
+        if self.fft_mode != 2 {
+            return None;
+        }
+        self.fft_panel_rect(canvas_w, canvas_h)
     }
 
     /// Goniometer column within the Phase panel: `(x, y, w, h)`.
@@ -2685,7 +2706,19 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
         let rx = pos.x - wx;
         let ry = pos.y - wy;
         let in_wave = rx >= 0.0 && ry >= 0.0 && rx <= ww && ry <= wh;
-        let t = if in_wave {
+        // The spectrogram shares the waveform's time axis and x range, so
+        // the same gestures mean the same thing there. Reaching for them and
+        // having nothing happen is the surprising behaviour, not the other
+        // way round. Kept separate from `in_wave` because waveform-specific
+        // interactions (splits, trim handles, the dB guide) are about the
+        // AMPLITUDE axis, which the spectrogram doesn't have.
+        let in_sgram = self
+            .spectrogram_rect(bounds.width, bounds.height)
+            .is_some_and(|(sx, sy, sw, sh)| {
+                pos.x >= sx && pos.x <= sx + sw && pos.y >= sy && pos.y <= sy + sh
+            });
+        let in_timeline = in_wave || in_sgram;
+        let t = if in_timeline {
             self.x_to_t(rx, ww)
         } else {
             self.scroll
@@ -2696,7 +2729,7 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
 
         match event {
             canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) => {
-                if !in_wave {
+                if !in_timeline {
                     return (canvas::event::Status::Ignored, None);
                 }
                 let (dx, dy) = match delta {
@@ -2730,7 +2763,7 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
                 )
             }
             canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Middle)) => {
-                if in_wave {
+                if in_timeline {
                     state.panning_from = Some((rx, self.scroll));
                 }
                 (canvas::event::Status::Captured, None)
@@ -2780,6 +2813,15 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
                             Some(CanvasEvent::NavigateTo(frac * self.duration)),
                         );
                     }
+                }
+                // Spectrogram: click to seek, drag to scrub — same as the
+                // waveform, because it's the same time axis.
+                if in_sgram {
+                    state.dragging_sgram = true;
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(CanvasEvent::Seek(t.clamp(0.0, self.duration))),
+                    );
                 }
                 if self.mono_badge_hit(bounds.width, bounds.height, pos.x, pos.y) {
                     return (
@@ -2907,7 +2949,13 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
                         Some(CanvasEvent::MoveSplit(i, t)),
                     );
                 }
-                if !in_wave {
+                if state.dragging_sgram {
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(CanvasEvent::Seek(t.clamp(0.0, self.duration))),
+                    );
+                }
+                if !in_timeline {
                     if state.last_hover_px.is_some() {
                         state.last_hover_px = None;
                         return (
@@ -2936,6 +2984,7 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
                 state.dragging_guide = false;
                 state.dragging_trim = None;
                 state.dragging_overview = false;
+                state.dragging_sgram = false;
                 (canvas::event::Status::Captured, None)
             }
             _ => (canvas::event::Status::Ignored, None),
@@ -3118,6 +3167,36 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
                     );
                 }
             }
+
+            // Mirror the playhead and hover line onto the spectrogram.
+            // Without them the panel looks interactive but reads as inert —
+            // and there's no way to line a moment in the image up with a
+            // moment in the waveform, which is most of why you'd have both
+            // on screen at once.
+            if let Some((sx, sy, sw, sh)) = self.spectrogram_rect(total_w, total_h) {
+                if let Some(t) = self.playhead_secs {
+                    let x = sx + self.t_to_x(t, sw);
+                    if x >= sx && x <= sx + sw {
+                        frame.stroke(
+                            &Path::line(Point::new(x, sy), Point::new(x, sy + sh)),
+                            Stroke::default()
+                                .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.95))
+                                .with_width(1.5),
+                        );
+                    }
+                }
+                if let Some(t) = self.hover_secs {
+                    let x = sx + self.t_to_x(t, sw);
+                    if x >= sx && x <= sx + sw {
+                        frame.stroke(
+                            &Path::line(Point::new(x, sy), Point::new(x, sy + sh)),
+                            Stroke::default()
+                                .with_color(Color::from_rgba(1.0, 1.0, 1.0, 0.30))
+                                .with_width(1.0),
+                        );
+                    }
+                }
+            }
         });
 
         vec![static_layer, meter_layer, overlay]
@@ -3195,6 +3274,8 @@ pub struct DragState {
     pub dragging_trim: Option<TrimHandle>,
     /// True while scrubbing the correlation overview strip.
     pub dragging_overview: bool,
+    /// True while scrubbing on the spectrogram panel.
+    pub dragging_sgram: bool,
 }
 
 /// Which trim boundary a drag is moving.
