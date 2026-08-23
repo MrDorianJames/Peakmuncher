@@ -40,6 +40,9 @@ pub enum CanvasEvent {
     RepairClick(usize),
     /// Mono-fold badge in the goniometer's corner was clicked.
     ToggleMonoFold,
+    /// Frequency band selected by dragging on the correlation curve, in Hz.
+    /// `None` clears the selection (a click without a drag).
+    SelectBand(Option<(f32, f32)>),
     /// Clicked or dragged on the correlation overview strip: seek here AND
     /// bring the zoomed view to this point. Distinct from `Seek` because the
     /// strip always shows the whole file, so its target is usually outside
@@ -49,6 +52,14 @@ pub enum CanvasEvent {
 }
 
 /// Size of the mono-fold badge drawn in the goniometer's top-right corner.
+/// Padding inside the correlation-curve panel. Shared by the drawing and
+/// the drag hit-test, so a click lands on the frequency it looks like it
+/// lands on.
+const CORR_PAD_L: f32 = 26.0;
+const CORR_PAD_R: f32 = 8.0;
+const CORR_PAD_T: f32 = 18.0;
+const CORR_PAD_B: f32 = 14.0;
+
 const MONO_BADGE_W: f32 = 30.0;
 const MONO_BADGE_H: f32 = 18.0;
 
@@ -146,6 +157,10 @@ pub struct Waveform<'a> {
     /// Whole-file correlation over time, for the strip at the top of the
     /// Phase panel. `None` until computed.
     pub corr_timeline: Option<&'a crate::fft::CorrTimeline>,
+    /// Selected frequency band on the correlation curve, in Hz.
+    pub band_sel: Option<(f32, f32)>,
+    /// Correlation measured on the selected band only.
+    pub band_sel_corr: Option<f32>,
     /// Whether mono-fold monitoring is engaged (lights the goniometer badge).
     pub mono_fold: bool,
     /// Per-frequency correlation at the probe: `(corr, weight)` per FFT bin,
@@ -268,6 +283,38 @@ impl<'a> Waveform<'a> {
             return None;
         }
         self.fft_panel_rect(canvas_w, canvas_h)
+    }
+
+    /// Rect of the correlation-curve PLOT area (inside its padding), when
+    /// Phase is the active panel.
+    fn corr_plot_rect(&self, canvas_w: f32, canvas_h: f32) -> Option<(f32, f32, f32, f32)> {
+        let panel = self.phase_panel_rect(canvas_w, canvas_h)?;
+        let (gx, _gy, _gw, _gh) = Self::gonio_rect(panel);
+        let (pxx, pyy, _pw, ph) = panel;
+        let band_w = (gx - pxx).max(40.0);
+        let x = pxx + CORR_PAD_L;
+        let w = (band_w - CORR_PAD_L - CORR_PAD_R).max(1.0);
+        let y = pyy + CORR_PAD_T;
+        let h = (ph - CORR_PAD_T - CORR_PAD_B).max(1.0);
+        Some((x, y, w, h))
+    }
+
+    /// Frequency range covered by the correlation curve's x axis.
+    fn corr_freq_range(&self) -> Option<(f32, f32)> {
+        if self.sample_rate == 0 || self.probe_band_corr.is_empty() {
+            return None;
+        }
+        let nyq = self.sample_rate as f32 / 2.0;
+        let lo = 20.0_f32.max(nyq / self.probe_band_corr.len() as f32);
+        Some((lo, nyq))
+    }
+
+    /// Map an x position inside the curve plot to a frequency in Hz.
+    fn corr_x_to_hz(&self, x_frac: f32) -> Option<f32> {
+        let (lo, hi) = self.corr_freq_range()?;
+        let log_lo = lo.log10();
+        let span = (hi.log10() - log_lo).max(1e-6);
+        Some(10f32.powf(log_lo + x_frac.clamp(0.0, 1.0) * span))
     }
 
     /// Rect of the spectrogram, or `None` when it isn't the active panel.
@@ -2368,13 +2415,10 @@ impl<'a> Waveform<'a> {
     fn draw_band_correlation(&self, frame: &mut Frame, wx: f32, y: f32, w: f32, h: f32) {
         use iced::widget::canvas::Text;
 
-        let pad_l = 26.0;
-        let pad_b = 14.0;
-        let pad_t = 18.0;
-        let px0 = wx + pad_l;
-        let plot_w = (w - pad_l - 8.0).max(1.0);
-        let py0 = y + pad_t;
-        let plot_h = (h - pad_t - pad_b).max(1.0);
+        let px0 = wx + CORR_PAD_L;
+        let plot_w = (w - CORR_PAD_L - CORR_PAD_R).max(1.0);
+        let py0 = y + CORR_PAD_T;
+        let plot_h = (h - CORR_PAD_T - CORR_PAD_B).max(1.0);
 
         let corr_to_y = |c: f32| -> f32 {
             let t = ((c + 1.0) / 2.0).clamp(0.0, 1.0);
@@ -2569,6 +2613,42 @@ impl<'a> Waveform<'a> {
         }
         flush(frame, &mut seg);
 
+        // ---- Selected band ----------------------------------------------
+        // Dim everything OUTSIDE the selection rather than tinting what's
+        // inside: the selected region keeps its true colours (which are the
+        // measurement), and the eye still reads the bright part as "this is
+        // what I picked".
+        if let Some((f_lo, f_hi)) = self.band_sel {
+            let to_x = |hz: f32| -> f32 {
+                px0 + ((hz.log10() - log_lo) / log_span).clamp(0.0, 1.0) * plot_w
+            };
+            let x0 = to_x(f_lo);
+            let x1 = to_x(f_hi).max(x0 + 1.0);
+            let shade = Color::from_rgba(0.0, 0.0, 0.0, 0.55);
+            if x0 > px0 {
+                frame.fill_rectangle(
+                    Point::new(px0, py0),
+                    Size::new(x0 - px0, plot_h),
+                    shade,
+                );
+            }
+            if x1 < px0 + plot_w {
+                frame.fill_rectangle(
+                    Point::new(x1, py0),
+                    Size::new(px0 + plot_w - x1, plot_h),
+                    shade,
+                );
+            }
+            for ex in [x0, x1] {
+                frame.stroke(
+                    &Path::line(Point::new(ex, py0), Point::new(ex, py0 + plot_h)),
+                    Stroke::default()
+                        .with_color(Color::from_rgba(0.55, 0.90, 1.0, 0.75))
+                        .with_width(1.0),
+                );
+            }
+        }
+
         // ---- Broadband reference + readout ------------------------------
         // Seeing the average against the curve is the whole point — a +0.76
         // average with a red pocket at 200 Hz is a different situation from
@@ -2676,12 +2756,32 @@ impl<'a> Waveform<'a> {
             frame.fill(&dot, Color::from_rgba(0.45, 0.85, 0.95, 0.5));
         }
 
-        // Label only — the correlation number lives on the frequency panel
-        // to the left, next to the dashed line that shows the same value.
+        // Label. With a band selected, say so — an unlabelled scatter that
+        // silently means "only 300–800 Hz" would be worse than no feature.
+        let (label, col) = match (self.band_sel, self.band_sel_corr) {
+            (Some((lo, hi)), corr) => {
+                let fmt = |f: f32| {
+                    if f >= 1000.0 {
+                        format!("{:.1}k", f / 1000.0)
+                    } else {
+                        format!("{f:.0}")
+                    }
+                };
+                let mut s = format!("{}–{} Hz", fmt(lo), fmt(hi));
+                if let Some(c) = corr {
+                    s.push_str(&format!("   {c:+.2}"));
+                }
+                (s, Color::from_rgba(0.55, 0.90, 1.0, 0.9))
+            }
+            _ => (
+                "goniometer".to_string(),
+                Color::from_rgba(1.0, 1.0, 1.0, 0.45),
+            ),
+        };
         frame.fill_text(Text {
-            content: "goniometer".to_string(),
+            content: label,
             position: Point::new(wx + 6.0, y + 2.0),
-            color: Color::from_rgba(1.0, 1.0, 1.0, 0.45),
+            color: col,
             size: 11.0.into(),
             ..Text::default()
         });
@@ -2812,6 +2912,19 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
                             canvas::event::Status::Captured,
                             Some(CanvasEvent::NavigateTo(frac * self.duration)),
                         );
+                    }
+                }
+                // Correlation curve: drag horizontally to select a
+                // frequency band for the goniometer.
+                if let Some((cx, cy, cw, chh)) =
+                    self.corr_plot_rect(bounds.width, bounds.height)
+                {
+                    if pos.x >= cx && pos.x <= cx + cw && pos.y >= cy && pos.y <= cy + chh {
+                        state.band_drag_from = Some(((pos.x - cx) / cw.max(1.0)).clamp(0.0, 1.0));
+                        // Don't emit yet: a press that turns out to be a
+                        // click (no drag) means "clear", and we can't tell
+                        // which it is until the button comes back up.
+                        return (canvas::event::Status::Captured, None);
                     }
                 }
                 // Spectrogram: click to seek, drag to scrub — same as the
@@ -2949,6 +3062,29 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
                         Some(CanvasEvent::MoveSplit(i, t)),
                     );
                 }
+                if let Some(anchor) = state.band_drag_from {
+                    if let Some((cx, _cy, cw, _ch)) =
+                        self.corr_plot_rect(bounds.width, bounds.height)
+                    {
+                        let here = ((pos.x - cx) / cw.max(1.0)).clamp(0.0, 1.0);
+                        if (here - anchor).abs() > 0.004 {
+                            let (a, b) = if anchor <= here {
+                                (anchor, here)
+                            } else {
+                                (here, anchor)
+                            };
+                            if let (Some(f_lo), Some(f_hi)) =
+                                (self.corr_x_to_hz(a), self.corr_x_to_hz(b))
+                            {
+                                return (
+                                    canvas::event::Status::Captured,
+                                    Some(CanvasEvent::SelectBand(Some((f_lo, f_hi)))),
+                                );
+                            }
+                        }
+                    }
+                    return (canvas::event::Status::Captured, None);
+                }
                 if state.dragging_sgram {
                     return (
                         canvas::event::Status::Captured,
@@ -2985,6 +3121,21 @@ impl<'a> canvas::Program<CanvasEvent> for Waveform<'a> {
                 state.dragging_trim = None;
                 state.dragging_overview = false;
                 state.dragging_sgram = false;
+                // A press-and-release on the curve without a drag is a
+                // click, which means "clear the selection".
+                if let Some(anchor) = state.band_drag_from.take() {
+                    if let Some((cx, _cy, cw, _ch)) =
+                        self.corr_plot_rect(bounds.width, bounds.height)
+                    {
+                        let here = ((pos.x - cx) / cw.max(1.0)).clamp(0.0, 1.0);
+                        if (here - anchor).abs() <= 0.004 {
+                            return (
+                                canvas::event::Status::Captured,
+                                Some(CanvasEvent::SelectBand(None)),
+                            );
+                        }
+                    }
+                }
                 (canvas::event::Status::Captured, None)
             }
             _ => (canvas::event::Status::Ignored, None),
@@ -3276,6 +3427,9 @@ pub struct DragState {
     pub dragging_overview: bool,
     /// True while scrubbing on the spectrogram panel.
     pub dragging_sgram: bool,
+    /// Anchor x-fraction of an in-progress frequency-band drag on the
+    /// correlation curve. `None` when not dragging a band.
+    pub band_drag_from: Option<f32>,
 }
 
 /// Which trim boundary a drag is moving.

@@ -618,6 +618,11 @@ struct App {
     /// Whole-file correlation over time, computed from the PROCESSED buffer.
     /// `None` = not computed yet (lazy: only built when Phase mode is on).
     corr_timeline: Option<Arc<fft::CorrTimeline>>,
+    /// Frequency band selected by dragging on the correlation curve, in Hz.
+    /// `None` = whole spectrum (the goniometer shows everything).
+    band_sel: Option<(f32, f32)>,
+    /// Band-limited correlation for `band_sel`, shown beside the scatter.
+    band_sel_corr: Option<f32>,
     /// Per-frequency stereo correlation at the probe: one `(corr, weight)`
     /// per FFT bin. Empty for mono files or when there's no signal.
     probe_band_corr: Vec<(f32, f32)>,
@@ -1100,6 +1105,8 @@ impl App {
                 probe_correlation: None,
                 probe_gonio: Vec::new(),
                 probe_band_corr: Vec::new(),
+                band_sel: None,
+                band_sel_corr: None,
                 mono_fold: false,
                 corr_timeline: None,
                 spectrum_line_in: None,
@@ -1584,6 +1591,13 @@ impl App {
                         // Parking the playhead = moving the probe point.
                         self.refresh_spectrum_line();
                         self.refresh_stereo_meters();
+                    }
+                    CanvasEvent::SelectBand(sel) => {
+                        if self.band_sel != sel {
+                            self.band_sel = sel;
+                            // Recompute the scatter for the new band.
+                            self.refresh_stereo_meters();
+                        }
                     }
                     CanvasEvent::NavigateTo(t) => {
                         self.navigate_to(t);
@@ -3709,16 +3723,38 @@ impl App {
         };
         self.probe_correlation = Some(corr);
 
-        // Goniometer points: downsample the window to ~600 points (L,R) pairs.
-        let target = 600usize;
-        let stepd = ((hi - lo) / target).max(1);
+        // Goniometer points. With a frequency band selected on the
+        // correlation curve, plot only that band — the broadband scatter is
+        // energy-weighted, so a narrow out-of-phase region contributes only
+        // its share of the dots and vanishes under a loud near-mono kick.
+        const GONIO_POINTS: usize = 600;
         self.probe_gonio.clear();
-        let mut f = lo;
-        while f < hi {
-            let l = buf.samples[f * ch];
-            let r = buf.samples[f * ch + 1];
-            self.probe_gonio.push((l, r));
-            f += stepd;
+        self.band_sel_corr = None;
+        let mut used_band = false;
+        if let Some((f_lo, f_hi)) = self.band_sel {
+            if let Some((pts, bcorr)) = fft::band_limited_gonio(
+                &buf.samples,
+                ch,
+                probe,
+                sr,
+                f_lo,
+                f_hi,
+                GONIO_POINTS,
+            ) {
+                self.probe_gonio = pts;
+                self.band_sel_corr = Some(bcorr);
+                used_band = true;
+            }
+        }
+        if !used_band {
+            let stepd = ((hi - lo) / GONIO_POINTS).max(1);
+            let mut f = lo;
+            while f < hi {
+                let l = buf.samples[f * ch];
+                let r = buf.samples[f * ch + 1];
+                self.probe_gonio.push((l, r));
+                f += stepd;
+            }
         }
 
         // Per-frequency correlation. The broadband number above is
@@ -4178,6 +4214,8 @@ impl App {
                 probe_correlation: self.probe_correlation,
                 probe_band_corr: &self.probe_band_corr,
                 mono_fold: self.mono_fold,
+                band_sel: self.band_sel,
+                band_sel_corr: self.band_sel_corr,
                 corr_timeline: self.corr_timeline.as_deref(),
                 probe_gonio: &self.probe_gonio,
                 spectrogram_in: self.spectrogram_in.as_deref(),

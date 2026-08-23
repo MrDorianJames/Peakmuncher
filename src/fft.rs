@@ -421,6 +421,115 @@ pub fn correlation_timeline(samples: &[f32], channels: usize, sample_rate: u32) 
 /// dB value represented by u8 code 0 (see `Spectrogram::data`).
 const SG_DB_FLOOR: f32 = -120.0;
 
+/// Band-limit a stereo window and return goniometer points plus the band's
+/// own correlation.
+///
+/// Used by the frequency selection on the correlation curve: the broadband
+/// goniometer is energy-weighted, so a narrow band that's badly out of phase
+/// contributes only its share of the dots and disappears under a loud
+/// near-mono kick. Restricting to the selected band is what makes the
+/// scatter actually show the problem the curve is reporting.
+///
+/// Method: FFT both channels, zero every bin outside `[lo_hz, hi_hz]`, then
+/// inverse FFT. Brick-wall filtering rings in the time domain, which would
+/// be unacceptable for audio you listen to — here it's fine, because the
+/// goniometer only cares about the L/R *relationship*, and the ringing is
+/// identical in both channels so it doesn't bias the phase picture.
+///
+/// Returns `(points, correlation)`, or `None` for mono / too-short input.
+pub fn band_limited_gonio(
+    samples: &[f32],
+    channels: usize,
+    center_frame: usize,
+    sample_rate: u32,
+    lo_hz: f32,
+    hi_hz: f32,
+    max_points: usize,
+) -> Option<(Vec<(f32, f32)>, f32)> {
+    if channels < 2 || sample_rate == 0 {
+        return None;
+    }
+    let n = CORR_FFT_SIZE;
+    let frames = samples.len() / channels;
+    if frames < n {
+        return None;
+    }
+    let half = n / 2;
+    let start = (center_frame as isize - half as isize).clamp(0, (frames - n) as isize) as usize;
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fwd = planner.plan_fft_forward(n);
+    let inv = planner.plan_fft_inverse(n);
+
+    // No analysis window here: a Hann taper would fade the edges of the
+    // block toward zero, piling up dots at the origin and squashing the
+    // apparent width. The block is rectangular and we accept the spectral
+    // leakage, since we're throwing away magnitudes anyway.
+    let mut bl: Vec<Complex32> = (0..n)
+        .map(|i| Complex32::new(samples[(start + i) * channels], 0.0))
+        .collect();
+    let mut br: Vec<Complex32> = (0..n)
+        .map(|i| Complex32::new(samples[(start + i) * channels + 1], 0.0))
+        .collect();
+    fwd.process(&mut bl);
+    fwd.process(&mut br);
+
+    let nyq = sample_rate as f32 / 2.0;
+    let bins = n / 2;
+    let b_lo = ((lo_hz / nyq) * bins as f32).floor().max(0.0) as usize;
+    let b_hi = (((hi_hz / nyq) * bins as f32).ceil() as usize).clamp(b_lo + 1, bins);
+
+    // Zero everything outside the band, in BOTH halves of the spectrum —
+    // the upper half is the conjugate mirror, and leaving it populated
+    // would produce a complex (non-real) inverse transform.
+    let zero = Complex32::new(0.0, 0.0);
+    for k in 0..n {
+        let mirror = if k <= half { k } else { n - k };
+        if mirror < b_lo || mirror >= b_hi {
+            bl[k] = zero;
+            br[k] = zero;
+        }
+    }
+    inv.process(&mut bl);
+    inv.process(&mut br);
+
+    let scale = 1.0 / n as f32;
+    // Correlation of the band-limited signals, so the readout beside the
+    // scatter is measured on exactly what's being drawn.
+    let mut sum_ll = 0.0f64;
+    let mut sum_rr = 0.0f64;
+    let mut sum_lr = 0.0f64;
+    for i in 0..n {
+        let l = (bl[i].re * scale) as f64;
+        let r = (br[i].re * scale) as f64;
+        sum_ll += l * l;
+        sum_rr += r * r;
+        sum_lr += l * r;
+    }
+    let denom = (sum_ll * sum_rr).sqrt();
+    let corr = if denom > 1e-18 {
+        (sum_lr / denom).clamp(-1.0, 1.0) as f32
+    } else {
+        0.0
+    };
+
+    // Normalize the scatter so a quiet band still fills the scope. Without
+    // this, selecting a band 40 dB down draws a dot at the origin — the
+    // shape is the information here, not the level.
+    let peak = (0..n)
+        .map(|i| bl[i].re.abs().max(br[i].re.abs()) * scale)
+        .fold(0.0f32, f32::max);
+    let gain = if peak > 1e-9 { 0.9 / peak } else { 0.0 };
+
+    let step = (n / max_points.max(1)).max(1);
+    let points: Vec<(f32, f32)> = (0..n)
+        .step_by(step)
+        .map(|i| (bl[i].re * scale * gain, br[i].re * scale * gain))
+        .collect();
+
+    Some((points, corr))
+}
+
 /// A whole-file spectrogram: a flat `time × freq` grid of dB magnitudes.
 ///
 /// Stored as **u8**, not f32. Raising the resolution to 4096/512 multiplies
